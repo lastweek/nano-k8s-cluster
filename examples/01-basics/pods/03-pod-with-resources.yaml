@@ -1,0 +1,60 @@
+# Pod with Resource Limits
+#
+# This example demonstrates how to set CPU and memory resource constraints.
+#
+# Key concepts:
+# - requests: Guaranteed resources for scheduling
+# - limits: Maximum resources a container can use
+#
+# For LLM workloads, proper resource management is critical:
+# - GPU memory limits prevent OOM
+# - CPU requests ensure scheduling on capable nodes
+# - Memory limits prevent resource exhaustion
+#
+# Usage:
+#   kubectl apply -f pod-with-resources.yaml
+#   kubectl describe pod pod-with-resources
+#   kubectl delete pod pod-with-resources
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-with-resources
+  labels:
+    app: nginx
+    demo: resources
+spec:
+  containers:
+  - name: nginx
+    image: nginx:1.25
+    ports:
+    - containerPort: 80
+
+    # Resource requests and limits
+    resources:
+      # Guaranteed resources (used for scheduling decisions)
+      requests:
+        cpu: "250m"      # 0.25 CPU cores (1/4 of a core)
+        memory: "64Mi"   # 64 megabytes of RAM
+
+      # Maximum resources (enforced at runtime)
+      limits:
+        cpu: "500m"      # 0.5 CPU cores (1/2 of a core)
+        memory: "128Mi"  # 128 megabytes of RAM
+
+# Resource units:
+# - CPU: "100m" = 0.1 CPU cores (1/10th), "1000m" = 1 CPU core
+# - Memory: "64Mi" = 64 mebibytes, "1Gi" = 1 gibibyte
+#
+# When requests == limits:
+#   - Container gets guaranteed resources (QoS class: Guaranteed)
+#   - Less likely to be evicted under memory pressure
+#
+# When requests < limits:
+#   - Container gets burstable resources (QoS class: Burstable)
+#   - May be throttled when exceeding requests
+#   - May be evicted under memory pressure
+#
+# When no requests set:
+#   - Best effort (QoS class: BestEffort)
+#   - First to be evicted under resource pressure

@@ -1,0 +1,25 @@
+# Simple Pod Example
+#
+# This is the most basic pod - a single container running nginx.
+#
+# Usage:
+#   kubectl apply -f simple-pod.yaml
+#   kubectl get pods
+#   kubectl logs simple-pod
+#   kubectl delete pod simple-pod
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: simple-pod
+  labels:
+    app: nginx
+    example: basic
+spec:
+  containers:
+  - name: nginx
+    image: nginx:1.25
+    ports:
+    - name: http
+      containerPort: 80
+      protocol: TCP

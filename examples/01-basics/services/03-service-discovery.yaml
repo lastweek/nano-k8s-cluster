@@ -1,0 +1,125 @@
+# Service Discovery and DNS
+#
+# Kubernetes provides built-in DNS for service discovery.
+# Services are automatically registered in DNS.
+#
+# Key concepts:
+# - DNS records: <service-name>.<namespace>.svc.cluster.local
+# - Short names: <service-name> works within same namespace
+# - Cross-namespace: <service-name>.<namespace> works across namespaces
+# - Endpoint updates: DNS automatically updates as pods are added/removed
+#
+# For LLM serving:
+# - Services discover each other via DNS (frontend -> model-serving)
+# - No hardcoding IPs, services can scale/move freely
+#
+# Usage:
+#   kubectl apply -f 03-service-discovery.yaml
+#   kubectl delete -f 03-service-discovery.yaml
+
+---
+# Frontend Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  labels:
+    app: frontend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: frontend
+  template:
+    metadata:
+      labels:
+        app: frontend
+    spec:
+      containers:
+      - name: frontend
+        image: nginx:1.25
+        ports:
+        - containerPort: 80
+        env:
+        - name: BACKEND_URL
+          value: "http://backend-service"  # Service discovery via DNS
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+
+---
+# Backend Deployment 1
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend-v1
+  labels:
+    app: backend
+    version: v1
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: backend
+  template:
+    metadata:
+      labels:
+        app: backend
+        version: v1
+    spec:
+      containers:
+      - name: backend
+        image: nginx:1.25
+        ports:
+        - containerPort: 80
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+
+---
+# Backend Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend-service
+  labels:
+    app: backend
+spec:
+  type: ClusterIP
+  selector:
+    app: backend
+  ports:
+  - name: http
+    port: 80
+    targetPort: 80
+
+---
+# Frontend Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend-service
+  labels:
+    app: frontend
+spec:
+  type: ClusterIP
+  selector:
+    app: frontend
+  ports:
+  - name: http
+    port: 80
+    targetPort: 80
+
+# DNS Records Created:
+# - backend-service.default.svc.cluster.local
+# - frontend-service.default.svc.cluster.local
+#
+# Within default namespace:
+# - frontend-service
+# - backend-service
+#
+# From other namespace:
+# - backend-service.default
+# - frontend-service.default

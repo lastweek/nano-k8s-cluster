@@ -1,0 +1,110 @@
+# PersistentVolumeClaim (PVC)
+#
+# A PVC requests storage resources from the cluster.
+# Decouples storage from pod lifecycle.
+#
+# Key concepts:
+# - PVC: Request for storage (like a pod "requests" storage)
+# - PV: Actual storage resource (can be pre-provisioned or dynamic)
+# - Lifecycle: Data persists beyond pod lifetime
+# - Access Modes: ReadWriteOnce, ReadOnlyMany, ReadWriteMany
+#
+# For LLM serving:
+# - Model checkpoint storage
+# - Training data storage
+# - Model weights storage
+# - Vector database storage
+#
+# Usage:
+#   kubectl apply -f 02-persistent-volume-claim.yaml
+#   kubectl delete -f 02-persistent-volume-claim.yaml
+
+---
+# PersistentVolumeClaim
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: model-storage
+  labels:
+    app: model-storage
+spec:
+  accessModes:
+    - ReadWriteOnce  # Can be mounted by a single node
+    # Other options:
+    # - ReadOnlyMany: Read-only by many nodes
+    # - ReadWriteMany: Read-write by many nodes
+    # - ReadWriteOncePod: Read-write by single pod (Kubernetes 1.22+)
+  resources:
+    requests:
+      storage: 1Gi  # Request 1GB of storage
+  # storageClassName: standard  # Optional: specify storage class
+  # If omitted, uses default storage class
+
+---
+# Deployment using PVC
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: model-server
+  labels:
+    app: model-server
+spec:
+  replicas: 1  # ReadWriteOnce allows only one pod per node
+  selector:
+    matchLabels:
+      app: model-server
+  template:
+    metadata:
+      labels:
+        app: model-server
+    spec:
+      containers:
+      - name: server
+        image: nginx:1.25
+        ports:
+        - containerPort: 80
+        volumeMounts:
+        - name: models
+          mountPath: /models  # Mount PVC at /models
+        # Initialize with some data
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          echo "Initializing model storage..."
+          if [ ! -f /models/model.bin ]; then
+            echo "Creating placeholder model file..."
+            dd if=/dev/zero of=/models/model.bin bs=1M count=10 2>/dev/null
+            echo "Model file created at /models/model.bin"
+          else
+            echo "Model file already exists"
+          fi
+          echo "Available storage in /models:"
+          df -h /models
+          nginx -g 'daemon off;'
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+      volumes:
+      - name: models
+        persistentVolumeClaim:
+          claimName: model-storage  # Reference to PVC
+
+# Storage Lifecycle:
+# 1. PVC requests storage from cluster
+# 2. If StorageClass supports dynamic provisioning, PV is created automatically
+# 3. Pod mounts PVC via volume definition
+# 4. Data persists even if pod is deleted
+# 5. PVC must be explicitly deleted to remove storage
+
+# Access Modes:
+# - ReadWriteOnce (RWO): Single node read-write (default for most block storage)
+# - ReadOnlyMany (ROX): Many nodes read-only (for shared read-only data)
+# - ReadWriteMany (RWX): Many nodes read-write (for NFS, Ceph, etc.)
+# - ReadWriteOncePod (RWOP): Single pod read-write (Kubernetes 1.22+)
+
+# For LLM Serving:
+# - Model checkpoints: Use RWO or RWX depending on storage
+# - Training data: Use RWX if multiple pods need access
+# - Model weights: Use RWO for single-model serving
+# - Vector database: Use RWX for distributed access

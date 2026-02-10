@@ -1,0 +1,144 @@
+# Horizontal Pod Autoscaler (HPA) - Basic
+#
+# HPA automatically scales the number of pods based on observed metrics.
+#
+# Key concepts:
+# - HPA: Automatically adjusts replica count based on metrics
+# - Metrics: CPU, memory, custom metrics
+# - Target utilization: Desired metric threshold
+# - Scale up/down: Add/remove pods to meet target
+#
+# For LLM serving:
+# - Scale out based on request latency/CPU
+# - Scale in during low traffic periods
+# - Cost optimization: run minimum pods during off-peak
+#
+# Prerequisites:
+# - metrics-server must be installed
+#   kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+#
+# Usage:
+#   kubectl apply -f 01-hpa-basic.yaml
+#   # Generate load: kubectl run -it --rm load-generator --image=busybox -- sh
+#   kubectl delete -f 01-hpa-basic.yaml
+
+---
+# Deployment with resource requests (required for HPA)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx-hpa
+  labels:
+    app: nginx-hpa
+spec:
+  replicas: 2  # Initial replica count
+  selector:
+    matchLabels:
+      app: nginx-hpa
+  template:
+    metadata:
+      labels:
+        app: nginx-hpa
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.25
+        ports:
+        - containerPort: 80
+        # Resource requests REQUIRED for CPU-based HPA
+        resources:
+          requests:
+            cpu: 100m   # 100 millicores = 0.1 CPU
+            memory: 128Mi
+        # Optional: resource limits
+        limits:
+          cpu: 500m
+          memory: 512Mi
+
+---
+# Service for accessing the deployment
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx-hpa-service
+  labels:
+    app: nginx-hpa
+spec:
+  type: ClusterIP
+  selector:
+    app: nginx-hpa
+  ports:
+  - port: 80
+    targetPort: 80
+
+---
+# HorizontalPodAutoscaler
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: nginx-hpa
+  labels:
+    app: nginx-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: nginx-hpa
+  # Min/Max replicas
+  minReplicas: 2   # Minimum 2 pods
+  maxReplicas: 10  # Maximum 10 pods
+  # Target metrics for scaling
+  metrics:
+  # Scale based on CPU utilization
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization  # Percentage of requested CPU
+        averageUtilization: 50  # Target 50% CPU utilization
+  # Scale based on memory utilization
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization  # Percentage of requested memory
+        averageUtilization: 80  # Target 80% memory utilization
+  # Behavior configuration (optional)
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300  # Wait 5 min before scaling down
+      policies:
+      - type: Percent
+        value: 50  # Scale down by max 50% at once
+        periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 0  # Scale up immediately
+      policies:
+      - type: Percent
+        value: 100  # Can double pod count
+        periodSeconds: 30
+      - type: Pods
+        value: 4  # Or add max 4 pods at once
+        periodSeconds: 30
+      selectPolicy: Max  # Use the policy that allows more scaling
+
+# How HPA Works:
+# 1. Metrics server reports CPU/memory usage
+# 2. HPA controller checks metrics every 15 seconds (default)
+# 3. If average metric > target: scale up
+# 4. If average metric < target: scale down (after stabilization window)
+# 5. HPA adjusts deployment replica count
+#
+# Example Calculation:
+# - Current pods: 2
+# - CPU request: 100m
+# - Current CPU usage: 180m (90% of request)
+# - Target utilization: 50%
+# - Desired replicas = (180m / 50%) / 100m = 3.6 → 4 pods
+
+# For LLM Serving:
+# - Scale based on request queue length (custom metric)
+# - Scale based on GPU utilization (custom metric)
+# - Scale based on requests per second (custom metric)
+# - Minimum pods for baseline load
+# - Maximum pods limited by GPU availability

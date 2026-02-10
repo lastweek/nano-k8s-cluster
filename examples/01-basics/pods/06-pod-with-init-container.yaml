@@ -1,0 +1,130 @@
+# Pod with Init Container
+#
+# This example demonstrates init containers, which run before the main container starts.
+#
+# Use cases for init containers:
+# - Pre-download models from S3/HuggingFace
+# - Generate configuration files
+# - Wait for dependencies to be ready
+# - Setup database schemas
+# - Clone repositories
+#
+# Key behaviors:
+# - Init containers run to completion before main containers start
+# - Multiple init containers run sequentially in order
+# - If any init container fails, the pod restarts
+# - Init containers can share volumes with main containers
+#
+# For LLM workloads:
+# - Download models to shared volume
+# - Validate model files exist
+# - Generate model config based on available GPUs
+#
+# Usage:
+#   kubectl apply -f pod-with-init-container.yaml
+#   kubectl get pods -w  # Watch init container run first
+#   kubectl logs pod-with-init -c init-model-downloader
+#   kubectl logs pod-with-init -c main-app
+#   kubectl delete pod pod-with-init
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-with-init
+  labels:
+    app: model-server
+    demo: init-containers
+spec:
+  # Shared volume for init and main containers
+  volumes:
+  - name: model-storage
+    emptyDir:
+      medium: Memory  # RAM-backed for faster model loading
+      sizeLimit: 2Gi
+
+  # Init containers run BEFORE main containers
+  initContainers:
+  - name: init-model-downloader
+    image: busybox:1.36
+    # Simulates downloading a model file
+    command: ["/bin/sh", "-c"]
+    args:
+      - |
+        echo "Init Container: Starting model download..."
+        echo "Target: /models/model.bin"
+        echo ""
+
+        # Simulate download delay
+        for i in $(seq 1 5); do
+          echo "Downloading... [$i/5]"
+          sleep 2
+        done
+
+        # Create a dummy model file
+        echo "MODEL_DATA_v1.0_70B_PARAMETERS" > /models/model.bin
+        echo "Model downloaded successfully!"
+        echo ""
+
+        # Validate the file exists
+        if [ -f /models/model.bin ]; then
+          echo "Validation: Model file exists ✓"
+          ls -lh /models/model.bin
+        else
+          echo "Validation: Model file missing ✗"
+          exit 1
+        fi
+    volumeMounts:
+    - name: model-storage
+      mountPath: /models
+
+  # Main container starts only after init containers succeed
+  containers:
+  - name: main-app
+    image: nginx:1.25
+    ports:
+    - containerPort: 80
+    command: ["/bin/sh", "-c"]
+    args:
+      - |
+        echo "Main Container: Starting up..."
+        echo ""
+
+        # Check if model exists (downloaded by init container)
+        if [ -f /models/model.bin ]; then
+          echo "✓ Model file found:"
+          cat /models/model.bin
+          echo ""
+          echo "Starting model server..."
+          # In real LLM serving, this would start vLLM
+          nginx -g 'daemon off;'
+        else
+          echo "✗ Model file not found!"
+          exit 1
+        fi
+    volumeMounts:
+    - name: model-storage
+      mountPath: /models
+
+# Execution order:
+# 1. Pod created
+# 2. Init container "init-model-downloader" runs
+# 3. If init succeeds → Main container starts
+# 4. If init fails → Pod restarts from step 2
+# 5. Main container runs until completion
+
+# Multiple init containers example:
+#
+# initContainers:
+# - name: init-check-network
+#   image: busybox
+#   command: ['sh', '-c', 'nslookup s3.amazonaws.com']
+#
+# - name: init-download-model
+#   image: aws-cli
+#   command: ['aws', 's3', 'cp', 's3://models/model.bin', '/models/']
+#
+# - name: init-validate-model
+#   image: busybox
+#   command: ['sh', '-c', 'test -f /models/model.bin']
+#
+# Main container starts only after ALL init containers complete successfully.

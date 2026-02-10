@@ -1,0 +1,133 @@
+# StatefulSet
+#
+# A StatefulSet manages stateful applications with stable identity.
+# Unlike Deployments, StatefulSets provide:
+# - Stable, unique network identifiers
+# - Stable, persistent storage
+# - Ordered, graceful deployment and scaling
+# - Ordered, graceful deletion and termination
+#
+# Key concepts:
+# - StatefulSet: For stateful applications (databases, distributed systems)
+# - Headless Service: Required for DNS entries
+# - Pod naming: Ordered (web-0, web-1, web-2, ...)
+# - Stable identity: Pod name stays same even if rescheduled
+#
+# For LLM serving:
+# - Distributed training with fixed ranks
+# - Model serving with stable identity
+# - Distributed inference with worker coordination
+#
+# Usage:
+#   kubectl apply -f 01-statefulset.yaml
+#   kubectl delete -f 01-statefulset.yaml
+
+---
+# Headless Service (required for StatefulSet)
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx-headless
+  labels:
+    app: nginx-stateful
+spec:
+  ports:
+  - port: 80
+    name: web
+  clusterIP: None  # Headless service (no cluster IP)
+  selector:
+    app: nginx-stateful
+
+---
+# StatefulSet
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: web
+  labels:
+    app: nginx-stateful
+spec:
+  serviceName: "nginx-headless"  # Must match headless service name
+  replicas: 3
+  selector:
+    matchLabels:
+      app: nginx-stateful
+  template:
+    metadata:
+      labels:
+        app: nginx-stateful
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.25
+        ports:
+        - containerPort: 80
+          name: web
+        volumeMounts:
+        - name: www
+          mountPath: /usr/share/nginx/html
+        # Show pod index in response
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          # Get pod index from hostname
+          INDEX=$(hostname | rev | cut -d- -f1 | rev)
+          echo "Pod: web-$INDEX" > /usr/share/nginx/html/index.html
+          echo "Hostname: $(hostname)" >> /usr/share/nginx/html/index.html
+          echo "This pod has stable identity!" >> /usr/share/nginx/html/index.html
+          nginx -g 'daemon off;'
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+  # Volume claim template - each pod gets its own PVC
+  volumeClaimTemplates:
+  - metadata:
+      name: www
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      resources:
+        requests:
+          storage: 1Gi
+
+# StatefulSet Key Features:
+# 1. Stable Network Identity:
+#    - Pods named: web-0, web-1, web-2, ...
+#    - DNS: web-0.nginx-headless.default.svc.cluster.local
+#    - Identity persists across pod restarts
+#
+# 2. Stable Storage:
+#    - Each pod gets its own PVC
+#    - PVC named: www-web-0, www-web-1, www-web-2, ...
+#    - Data persists even if pod is deleted and recreated
+#
+# 3. Ordered Deployment:
+#    - web-0 starts first
+#    - web-1 starts after web-0 is ready
+#    - web-2 starts after web-1 is ready
+#
+# 4. Ordered Scaling:
+#    - Scale up: web-3 starts after web-2 is ready
+#    - Scale down: web-2 terminates before web-1
+#
+# 5. Ordered Rolling Updates:
+#    - web-2 updates first
+#    - web-1 updates after web-2 is ready
+#    - web-0 updates last
+
+# For LLM Training:
+# - Each pod has a fixed rank (from pod name)
+# - Distributed training requires stable identity
+# - Checkpoints stored on per-pod PVCs
+# - Pods can communicate via stable DNS names
+
+# Deployment vs StatefulSet:
+# ┌─────────────────┬─────────────────────┬──────────────────────┐
+# │ Feature         │ Deployment          │ StatefulSet          │
+# ├─────────────────┼─────────────────────┼──────────────────────┤
+# │ Pod names       │ Random hash         │ Ordered (web-0, 1, 2) │
+# │ Network         │ Unstable            │ Stable DNS names     │
+# │ Storage         │ Shared PVC          │ Per-pod PVCs         │
+# │ Ordering        │ Unordered           │ Ordered deployment   │
+# │ Use case        │ Stateless apps      │ Stateful apps        │
+# └─────────────────┴─────────────────────┴──────────────────────┘

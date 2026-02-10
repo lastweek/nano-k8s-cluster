@@ -1,0 +1,99 @@
+# EmptyDir Volume
+#
+# An EmptyDir volume is created when a Pod is assigned to a node.
+# It's empty initially and provides temporary storage for the pod lifetime.
+#
+# Key concepts:
+# - EmptyDir: Temporary storage shared between containers in a pod
+# - Lifetime: Exists as long as the pod runs
+# - Use cases: Shared data, caching, temporary files
+# - Data loss: Data is lost when pod is deleted
+#
+# For LLM serving:
+# - Temporary cache for model artifacts
+# - Shared scratch space between sidecar containers
+# - Intermediate computation results
+#
+# Usage:
+#   kubectl apply -f 01-emptydir.yaml
+#   kubectl delete -f 01-emptydir.yaml
+
+---
+# Pod with EmptyDir volume
+apiVersion: v1
+kind: Pod
+metadata:
+  name: emptydir-demo
+  labels:
+    app: emptydir-demo
+spec:
+  containers:
+  # Container 1: Writer - writes data to shared volume
+  - name: writer
+    image: busybox
+    command: ["/bin/sh", "-c"]
+    args:
+    - |
+      echo "Starting writer container..."
+      echo "This data is shared between containers" > /shared/data.txt
+      echo "Writer: Initial data written"
+      sleep 3600
+    volumeMounts:
+    - name: shared-volume
+      mountPath: /shared
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+
+  # Container 2: Reader - reads data from shared volume
+  - name: reader
+    image: busybox
+    command: ["/bin/sh", "-c"]
+    args:
+    - |
+      echo "Starting reader container..."
+      sleep 2
+      echo "Reader: Reading shared data:"
+      cat /shared/data.txt
+      echo ""
+      echo "Reader: Monitoring file for changes..."
+      while true; do
+        if [ -f /shared/data.txt ]; then
+          echo "Reader: Current content:"
+          cat /shared/data.txt
+        fi
+        sleep 10
+      done
+    volumeMounts:
+    - name: shared-volume
+      mountPath: /shared
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+
+  volumes:
+  - name: shared-volume
+    emptyDir:
+      sizeLimit: 100Mi  # Optional: limit storage size
+      # medium: ""  # Default is node's storage medium (disk)
+      # medium: "Memory"  # Use tmpfs (RAM-backed)
+
+# Key Points:
+# - EmptyDir is created when pod starts
+# - Deleted when pod is removed
+# - Shared between all containers in the pod
+# - Can be backed by disk (default) or memory (tmpfs)
+# - sizeLimit is optional (enforced if set)
+
+# Use Cases for LLM:
+# 1. Shared scratch space between main container and sidecars
+# 2. Temporary caching of downloaded models
+# 3. Intermediate results from preprocessing
+# 4. Log aggregation before shipping to external service
+
+# Memory-Backed EmptyDir (tmpfs):
+# Uncomment medium: "Memory" for RAM-based storage
+# Faster but limited by node memory
+# Data lost on pod restart

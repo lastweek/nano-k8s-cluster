@@ -1,0 +1,79 @@
+# Deployment Update Strategies Comparison
+#
+# This example shows two deployment strategies:
+# - RollingUpdate: Gradual replacement (default)
+# - Recreate: All pods down at once
+#
+# Key concepts:
+# - RollingUpdate: Zero downtime, slower rollout
+# - Recreate: Faster rollout, brief downtime
+#
+# For LLM serving:
+# - Use RollingUpdate for production
+# - Recreate might be acceptable for non-critical services
+#
+# Usage:
+#   kubectl apply -f 04-update-strategies.yaml
+#   # Compare the two deployments
+#   kubectl delete -f 04-update-strategies.yaml
+
+---
+# Deployment 1: RollingUpdate (default for production)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx-rolling
+  labels:
+    app: nginx
+    strategy: rolling
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0  # No downtime
+      maxSurge: 1         # 1 extra pod during update
+  selector:
+    matchLabels:
+      app: nginx
+  template:
+    metadata:
+      labels:
+        app: nginx
+        strategy: rolling
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.25
+        ports:
+        - containerPort: 80
+
+---
+# Deployment 2: Recreate (faster, has downtime)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx-recreate
+  labels:
+    app: nginx
+    strategy: recreate
+spec:
+  replicas: 3
+  strategy:
+    type: Recreate
+    # All pods down before new pods up
+    # Faster but causes downtime
+  selector:
+    matchLabels:
+      app: nginx
+  template:
+    metadata:
+      labels:
+        app: nginx
+        strategy: recreate
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.25
+        ports:
+        - containerPort: 80

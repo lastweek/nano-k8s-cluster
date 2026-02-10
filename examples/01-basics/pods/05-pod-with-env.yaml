@@ -1,0 +1,99 @@
+# Pod with Environment Variables
+#
+# This example shows different ways to configure containers with environment variables.
+#
+# Methods demonstrated:
+# 1. Direct value assignment
+# 2. From a ConfigMap
+# 3. From a Secret
+# 4. From Pod metadata (fieldRef)
+#
+# For LLM workloads, env vars commonly configure:
+# - Model name and path
+# - HuggingFace API tokens
+# - Server ports and endpoints
+# - Tensor parallelism settings
+# - GPU memory utilization
+#
+# Usage:
+#   kubectl apply -f pod-with-env.yaml
+#   kubectl exec -it pod-with-env -- env | grep MODEL
+#   kubectl delete pod pod-with-env
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-with-env
+  labels:
+    app: nginx
+    demo: environment
+spec:
+  containers:
+  - name: nginx
+    image: nginx:1.25
+    ports:
+    - containerPort: 80
+
+    # Environment variables can be set multiple ways
+    env:
+
+    # Method 1: Direct value assignment
+    - name: MODEL_NAME
+      value: "llama-70b"
+    - name: MAX_TOKENS
+      value: "4096"
+
+    # Method 2: From ConfigMap (referenced by name)
+    # Create first: kubectl create configmap app-config --from-literal=LOG_LEVEL=debug
+    # - name: LOG_LEVEL
+    #   valueFrom:
+    #     configMapKeyRef:
+    #       name: app-config
+    #       key: LOG_LEVEL
+
+    # Method 3: From Secret (referenced by name)
+    # Create first: kubectl create secret generic hf-secret --from-literal=HF_TOKEN=xxx
+    # - name: HF_TOKEN
+    #   valueFrom:
+    #     secretKeyRef:
+    #       name: hf-secret
+    #       key: HF_TOKEN
+
+    # Method 4: From Pod metadata
+    - name: POD_NAME
+      valueFrom:
+        fieldRef:
+          fieldPath: metadata.name
+    - name: POD_NAMESPACE
+      valueFrom:
+        fieldRef:
+          fieldPath: metadata.namespace
+    - name: POD_IP
+      valueFrom:
+        fieldRef:
+          fieldPath: status.podIP
+
+    # Method 5: From resource requests/limits
+    - name: CPU_REQUEST
+      valueFrom:
+        resourceFieldRef:
+          containerName: nginx
+          resource: requests.cpu
+    - name: MEMORY_LIMIT
+      valueFrom:
+        resourceFieldRef:
+          containerName: nginx
+          resource: limits.memory
+
+# Environment variable priority (highest to lowest):
+# 1. Direct value in env
+# 2. From Secret
+# 3. From ConfigMap
+# 4. Container image defaults
+# 5. System defaults
+#
+# Best practices for LLM serving:
+# - Use ConfigMaps for non-sensitive config (model params, ports)
+# - Use Secrets for sensitive data (API tokens, credentials)
+# - Use fieldRef for pod identity (for logging, metrics)
+# - Document all required env vars in your image documentation

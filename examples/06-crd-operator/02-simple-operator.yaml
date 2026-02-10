@@ -1,0 +1,334 @@
+# Simple Operator for LLMModel
+#
+# An operator is a controller that watches custom resources and takes action.
+# The "reconciliation loop" continuously watches and fixes things.
+#
+# Key concepts:
+# - Controller: Watches resources and reconciles desired vs actual state
+# - Reconciliation loop: Continuous watch → detect change → take action
+# - Desired state: What you want (LLMModel spec)
+# - Actual state: What exists (Deployment, pods)
+# - Operator: Brings actual in line with desired
+#
+# This operator will:
+# 1. Watch LLMModel resources
+# 2. Create/Update Deployments for each LLMModel
+# 3. Update LLMModel status with replica counts
+#
+# For LLM serving:
+# - Automatically deploy models
+# - Handle scaling
+# - Update status
+# - Clean up when deleted
+
+---
+# ServiceAccount for the operator
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: llm-operator
+  namespace: default
+
+---
+# Role: Permissions for the operator
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: llm-operator
+  namespace: default
+rules:
+- apiGroups: [""]
+  resources: ["pods", "services", "configmaps", "secrets"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "replicasets"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["ai.example.com"]
+  resources: ["llmmodels", "llmmodels/status"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+---
+# RoleBinding: Bind role to service account
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: llm-operator
+  namespace: default
+subjects:
+- kind: ServiceAccount
+  name: llm-operator
+  namespace: default
+roleRef:
+  kind: Role
+  name: llm-operator
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# Operator Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llm-operator
+  labels:
+    app: llm-operator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: llm-operator
+  template:
+    metadata:
+      labels:
+        app: llm-operator
+    spec:
+      serviceAccountName: llm-operator
+      containers:
+      - name: operator
+        image: python:3.11-slim
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          # Install kubectl and Python dependencies
+          apt-get update > /dev/null 2>&1
+          apt-get install -y curl > /dev/null 2>&1
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          mv kubectl /usr/local/bin/
+          pip install kubernetes pyyaml -q
+
+          # Create the operator script
+          cat > /tmp/operator.py << 'EOF'
+          from kubernetes import client, config
+          from kubernetes.watch import Watch
+          import time
+          import threading
+
+          # Load Kubernetes config
+          config.load_kube_config()
+          api = client.CustomObjectsApi()
+          apps = client.AppsV1Api()
+
+          CRD_GROUP = "ai.example.com"
+          CRD_VERSION = "v1"
+          CRD_PLURAL = "llmmodels"
+          NAMESPACE = "default"
+
+          def get_deployment_name(llmmodel_name):
+              return f"llmmodel-{llmmodel_name}"
+
+          def reconcile_llmmodel(llmmodel):
+              """Reconcile a single LLMModel resource"""
+              name = llmmodel['metadata']['name']
+              spec = llmmodel.get('spec', {})
+              status = llmmodel.get('status', {})
+
+              # Get or create Deployment
+              deployment_name = get_deployment_name(name)
+
+              # Build deployment spec from LLMModel spec
+              deployment_spec = {
+                  'apiVersion': 'apps/v1',
+                  'kind': 'Deployment',
+                  'metadata': {
+                      'name': deployment_name,
+                      'namespace': NAMESPACE,
+                      'labels': {
+                          'app': 'llm-serving',
+                          'llmmodel': name
+                      }
+                  },
+                  'spec': {
+                      'replicas': spec.get('replicas', 1),
+                      'selector': {
+                          'matchLabels': {
+                              'app': 'llm-serving',
+                              'llmmodel': name
+                          }
+                      },
+                      'template': {
+                          'metadata': {
+                              'labels': {
+                                  'app': 'llm-serving',
+                                  'llmmodel': name
+                              }
+                          },
+                          'spec': {
+                              'containers': [{
+                                  'name': 'model',
+                                  'image': 'nginx:1.25',  # Placeholder
+                                  'ports': [{'containerPort': 80}],
+                                  'env': [
+                                      {'name': 'MODEL_NAME', 'value': spec.get('modelName', '')},
+                                      {'name': 'MODEL_PATH', 'value': spec.get('modelPath', '')},
+                                      {'name': 'MAX_TOKENS', 'value': str(spec.get('maxTokens', 4096))},
+                                      {'name': 'TEMPERATURE', 'value': str(spec.get('temperature', 0.7))}
+                                  ]
+                              }]
+                          }
+                      }
+                  }
+              }
+
+              # Create or update deployment
+              try:
+                  # Try to get existing deployment
+                  apps.read_namespaced_deployment(deployment_name, NAMESPACE)
+                  # Update existing
+                  apps.patch_namespaced_deployment(
+                      name=deployment_name,
+                      namespace=NAMESPACE,
+                      body=deployment_spec
+                  )
+                  print(f"✓ Updated deployment {deployment_name}")
+              except client.ApiException as e:
+                  if e.status == 404:
+                      # Create new
+                      apps.create_namespaced_deployment(
+                          namespace=NAMESPACE,
+                          body=deployment_spec
+                      )
+                      print(f"✓ Created deployment {deployment_name}")
+                  else:
+                      raise
+
+              # Update status
+              try:
+                  deployment = apps.read_namespaced_deployment(deployment_name, NAMESPACE)
+                  ready_replicas = deployment.status.ready_replicas or 0
+
+                  status_patch = {
+                      'status': {
+                          'phase': 'Running',
+                          'replicas': deployment.spec.replicas,
+                          'readyReplicas': ready_replicas,
+                          'message': f'Deployment {deployment_name} has {ready_replicas}/{deployment.spec.replicas} ready replicas'
+                      }
+                  }
+
+                  api.patch_namespaced_custom_object(
+                      group=CRD_GROUP,
+                      version=CRD_VERSION,
+                      namespace=NAMESPACE,
+                      plural=CRD_PLURAL,
+                      name=name,
+                      body=status_patch
+                  )
+                  print(f"✓ Updated status for {name}")
+              except Exception as e:
+                  print(f"Error updating status: {e}")
+
+          def watch_resources():
+              """Watch for changes to LLMModel resources"""
+              w = Watch()
+              stream = w.stream(
+                  api.list_namespaced_custom_object,
+                  NAMESPACE,
+                  CRD_GROUP,
+                  CRD_VERSION,
+                  CRD_PLURAL,
+                  timeout_seconds=0
+              )
+
+              for event in stream:
+                  event_type = event['type']
+                  llmmodel = event['object']
+
+                  print(f"\nEvent: {event_type} - {llmmodel['metadata']['name']}")
+
+                  if event_type in ['ADDED', 'MODIFIED']:
+                      reconcile_llmmodel(llmmodel)
+                  elif event_type == 'DELETED':
+                      # Cleanup deployment
+                      deployment_name = get_deployment_name(llmmodel['metadata']['name'])
+                      try:
+                          apps.delete_namespaced_deployment(deployment_name, NAMESPACE)
+                          print(f"✓ Deleted deployment {deployment_name}")
+                      except Exception as e:
+                          print(f"Error deleting deployment: {e}")
+
+          print("🚀 LLM Operator started")
+          print("Watching for LLMModel resources...")
+          print("")
+
+          # Initial reconciliation of existing resources
+          try:
+              llmmodels = api.list_namespaced_custom_object(
+                  NAMESPACE, CRD_GROUP, CRD_VERSION, CRD_PLURAL
+              )
+              for llmmodel in llmmodels.get('items', []):
+                  print(f"Initial reconcile: {llmmodel['metadata']['name']}")
+                  reconcile_llmmodel(llmmodel)
+          except Exception as e:
+              print(f"Initial reconcile error: {e}")
+
+          # Start watching
+          watch_resources()
+          EOF
+
+          echo "Starting LLM Operator..."
+          python /tmp/operator.py
+        env:
+        - name: WATCH_NAMESPACE
+          value: "default"
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+
+---
+# Example LLMModel to deploy
+apiVersion: ai.example.com/v1
+kind: LLMModel
+metadata:
+  name: llama-3-70b-serving
+spec:
+  modelName: llama-3-70b
+  modelPath: /models/llama-3-70b
+  replicas: 2
+  gpuType: H100
+  gpuMemory: 80Gi
+  maxTokens: 4096
+  temperature: 0.7
+  enableStreaming: true
+  enableCache: true
+
+# How the Operator Works:
+#
+# ┌────────────────────────────────────────────────────────────┐
+# │  1. You create LLMModel resource                           │
+# │     kubectl apply -f model.yaml                           │
+# └────────────────────────────────────────────────────────────┘
+#                           │
+#                           ▼
+# ┌────────────────────────────────────────────────────────────┐
+# │  2. Operator detects change (via watch API)                │
+# │     Event: ADDED llama-3-70b-serving                       │
+# └────────────────────────────────────────────────────────────┘
+#                           │
+#                           ▼
+# ┌────────────────────────────────────────────────────────────┐
+# │  3. Reconciliation Loop                                     │
+# │     - Read LLMModel spec                                   │
+# │     - Create/Update Deployment                             │
+# │     - Update LLMModel status                               │
+# └────────────────────────────────────────────────────────────┘
+#                           │
+#                           ▼
+# ┌────────────────────────────────────────────────────────────┐
+# │  4. Kubernetes creates Deployment                           │
+# │     Deployment creates pods                                │
+# │     Pods run your model serving containers                 │
+# └────────────────────────────────────────────────────────────┘
+
+# The Control Loop (Reconciliation):
+#
+# while true:
+#     desired_state = get_llmmodel_spec()
+#     actual_state = get_deployment_status()
+#
+#     if desired_state != actual_state:
+#         reconcile()
+#
+#     sleep()
+#
+# This runs continuously, always watching and fixing.

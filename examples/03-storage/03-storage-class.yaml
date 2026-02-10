@@ -1,0 +1,155 @@
+# StorageClass and Dynamic Provisioning
+#
+# StorageClass defines different storage types (fast, slow, encrypted, etc.).
+# Enables dynamic provisioning of PVs when PVC is created.
+#
+# Key concepts:
+# - StorageClass: Profile or "class" of storage
+# - Dynamic provisioning: Automatic PV creation when PVC is created
+# - Provisioner: Plugin that creates storage (hostPath, AWS EBS, etc.)
+# - Reclaim policy: What happens when PVC is deleted (Retain, Delete, Recycle)
+#
+# For LLM serving:
+# - Fast SSD for model serving
+# - HDD for checkpoint storage
+# - NVMe for high-performance serving
+#
+# Usage:
+#   kubectl apply -f 03-storage-class.yaml
+#   kubectl delete -f 03-storage-class.yaml
+
+---
+# StorageClass: Standard (slow)
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: standard
+provisioner: kubernetes.io/host-path  # For minikube/kind
+parameters:
+  type: dir  # Directory-based host path
+reclaimPolicy: Delete  # Delete PV when PVC is deleted
+volumeBindingMode: Immediate
+# Other options for reclaimPolicy:
+# - Retain: Keep PV after PVC deletion (manual cleanup required)
+# - Delete: Automatically delete PV when PVC is deleted (default for dynamic provisioning)
+# - Recycle: Run rm -rf on volume (deprecated)
+
+---
+# StorageClass: Fast (SSD)
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: fast-ssd
+provisioner: kubernetes.io/host-path
+parameters:
+  type: dir
+reclaimPolicy: Delete
+volumeBindingMode: Immediate
+allowVolumeExpansion: true  # Allow expanding PVC size
+
+---
+# PVC using standard storage class
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pvc-standard
+  labels:
+    app: storage-demo
+    storage-class: standard
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: standard  # Reference to StorageClass
+  resources:
+    requests:
+      storage: 100Mi
+
+---
+# PVC using fast-ssd storage class
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pvc-fast
+  labels:
+    app: storage-demo
+    storage-class: fast-ssd
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: fast-ssd  # Reference to StorageClass
+  resources:
+    requests:
+      storage: 100Mi
+
+---
+# Pod using both PVCs
+apiVersion: v1
+kind: Pod
+metadata:
+  name: storage-class-demo
+  labels:
+    app: storage-demo
+spec:
+  containers:
+  - name: demo
+    image: busybox
+    command: ["/bin/sh", "-c"]
+    args:
+    - |
+      echo "Testing different storage classes..."
+      echo ""
+      echo "Standard Storage (HDD/slow):"
+      echo "  Writing to /mnt/standard..."
+      echo "This is standard storage" > /mnt/standard/data.txt
+      cat /mnt/standard/data.txt
+      df -h /mnt/standard
+      echo ""
+      echo "Fast Storage (SSD):"
+      echo "  Writing to /mnt/fast..."
+      echo "This is fast storage" > /mnt/fast/data.txt
+      cat /mnt/fast/data.txt
+      df -h /mnt/fast
+      echo ""
+      echo "Storage comparison complete"
+      sleep 3600
+    volumeMounts:
+    - name: standard-storage
+      mountPath: /mnt/standard
+    - name: fast-storage
+      mountPath: /mnt/fast
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+  volumes:
+  - name: standard-storage
+    persistentVolumeClaim:
+      claimName: pvc-standard
+  - name: fast-storage
+    persistentVolumeClaim:
+      claimName: pvc-fast
+
+# StorageClass Parameters (cloud providers):
+#
+# AWS EBS:
+#   - type: gp2, gp3, io1, io2, st1, sc1
+#   - encrypted: "true"
+#   - kmsKeyId: "arn:aws:kms:..."
+#
+# GCE PD:
+#   - type: pd-standard, pd-ssd, pd-balanced
+#   - fstype: ext4, xfs
+#
+# Azure Disk:
+#   - storageaccounttype: Standard_LRS, Premium_LRS
+#   - kind: Managed, Shared
+#
+# For LLM Serving:
+#   - Training checkpoints: Standard (HDD) - cost-effective
+#   - Model serving: Fast (SSD/NVMe) - low latency
+#   - Cache: Memory-backed (tmpfs) - fastest
+#   - Long-term storage: Cloud storage (S3, GCS) - cheapest
+
+# Volume Binding Modes:
+# - Immediate: PV provisioned immediately when PVC is created
+# - WaitForFirstConsumer: PV provisioned after pod scheduled (better for topology-aware storage)

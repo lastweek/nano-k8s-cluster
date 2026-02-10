@@ -1,0 +1,101 @@
+# ConfigMap (Basic)
+#
+# A ConfigMap stores non-confidential data in key-value pairs.
+# Pods can consume ConfigMaps as environment variables, command-line args, or files.
+#
+# Key concepts:
+# - ConfigMap: Store configuration data separately from pod specs
+# - Decoupling: Configuration changes don't require pod restarts
+# - Multiple sources: Environment variables, files, command-line args
+#
+# For LLM serving:
+# - Store model configuration, hyperparameters, feature flags
+# - Example: Model paths, batch sizes, temperature settings
+#
+# Usage:
+#   kubectl apply -f 01-configmap.yaml
+#   kubectl delete -f 01-configmap.yaml
+
+---
+# ConfigMap with key-value pairs
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: model-config
+  labels:
+    app: llm-serving
+data:
+  # Configuration for model serving
+  model.name: "llama-3-70b"
+  model.path: "/models/llama-3-70b"
+  serving.batchSize: "32"
+  serving.maxTokens: "4096"
+  serving.temperature: "0.7"
+  serving.topK: "50"
+  serving.topP: "0.9"
+
+  # Feature flags
+  features.streaming: "true"
+  features.cacheEnabled: "true"
+  features.metricsEnabled: "true"
+
+  # Logging configuration
+  log.level: "info"
+  log.format: "json"
+
+---
+# Pod using ConfigMap as environment variables
+apiVersion: v1
+kind: Pod
+metadata:
+  name: configmap-demo
+  labels:
+    app: configmap-demo
+spec:
+  containers:
+  - name: demo
+    image: nginx:1.25
+    ports:
+    - containerPort: 80
+    env:
+    # Reference individual keys from ConfigMap
+    - name: MODEL_NAME
+      valueFrom:
+        configMapKeyRef:
+          name: model-config
+          key: model.name
+    - name: MODEL_PATH
+      valueFrom:
+        configMapKeyRef:
+          name: model-config
+          key: model.path
+    - name: BATCH_SIZE
+      valueFrom:
+        configMapKeyRef:
+          name: model-config
+          key: serving.batchSize
+    - name: MAX_TOKENS
+      valueFrom:
+        configMapKeyRef:
+          name: model-config
+          key: serving.maxTokens
+    - name: TEMPERATURE
+      valueFrom:
+        configMapKeyRef:
+          name: model-config
+          key: serving.temperature
+    - name: LOG_LEVEL
+      valueFrom:
+        configMapKeyRef:
+          name: model-config
+          key: log.level
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+
+# Benefits:
+# - Configuration is separate from pod spec
+# - Update ConfigMap without changing pod spec
+# - Can be reused across multiple pods
+# - Version controlled separately from application code

@@ -1,0 +1,47 @@
+# Deployment Scaling Example
+#
+# This example demonstrates scaling deployments up and down.
+#
+# Key concepts:
+# - Manual scaling with kubectl scale
+# - Resource requirements for scaling
+# - Pod distribution across nodes
+#
+# Usage:
+#   kubectl apply -f 02-scaling.yaml
+#   kubectl scale deployment nginx-deployment --replicas=5
+#   kubectl scale deployment nginx-deployment --replicas=2
+#   kubectl delete -f 02-scaling.yaml
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx-scaling
+  labels:
+    app: nginx
+    example: scaling
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: nginx
+  template:
+    metadata:
+      labels:
+        app: nginx
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.25
+        ports:
+        - name: http
+          containerPort: 80
+        # Resources help scheduler make decisions
+        # when scaling to multiple nodes
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "100m"
+          limits:
+            memory: "128Mi"
+            cpu: "200m"

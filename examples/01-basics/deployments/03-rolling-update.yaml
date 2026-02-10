@@ -1,0 +1,48 @@
+# Rolling Update Example
+#
+# This example demonstrates rolling updates - zero-downtime deployments.
+#
+# Key concepts:
+# - RollingUpdate strategy: gradual replacement of pods
+# - maxUnavailable: how many pods can be down during update
+# - maxSurge: how many extra pods can be created during update
+# - revisionHistoryLimit: how many old versions to keep
+#
+# Usage:
+#   kubectl apply -f 03-rolling-update.yaml
+#   kubectl set image deployment/nginx-rolling nginx=nginx:1.26
+#   kubectl rollout status deployment/nginx-rolling
+#   kubectl rollout undo deployment/nginx-rolling
+#   kubectl delete -f 03-rolling-update.yaml
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx-rolling
+  labels:
+    app: nginx
+    example: rolling-update
+spec:
+  replicas: 3
+  # Important: RollingUpdate strategy (default)
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0   # No pods down during update
+      maxSurge: 1           # Can create 1 extra pod during update
+  selector:
+    matchLabels:
+      app: nginx
+  template:
+    metadata:
+      labels:
+        app: nginx
+        version: v1  # This label changes during updates
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.25  # Initial version
+        ports:
+        - name: http
+          containerPort: 80
+  revisionHistoryLimit: 3  # Keep last 3 versions

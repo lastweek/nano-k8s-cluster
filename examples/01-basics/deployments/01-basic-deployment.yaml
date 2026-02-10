@@ -1,0 +1,38 @@
+# Basic Deployment Example
+#
+# This is the simplest deployment - 3 replicas of nginx.
+#
+# Key concepts:
+# - Deployment: Manages ReplicaSets
+# - ReplicaSet: Ensures specified number of pod replicas
+# - Self-healing: Restarts crashed pods automatically
+#
+# Usage:
+#   kubectl apply -f 01-basic-deployment.yaml
+#   kubectl get all
+#   kubectl delete -f 01-basic-deployment.yaml
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx-deployment
+  labels:
+    app: nginx
+    example: basic
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: nginx
+  template:
+    metadata:
+      labels:
+        app: nginx
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.25
+        ports:
+        - name: http
+          containerPort: 80
+          protocol: TCP

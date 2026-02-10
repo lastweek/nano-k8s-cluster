@@ -1,0 +1,105 @@
+# Pod with Health Probes
+#
+# This example demonstrates Kubernetes health probes:
+# - Liveness Probe: Detects hangs and restarts container
+# - Readiness Probe: Controls traffic routing
+# - Startup Probe: Gives slow apps extra time to start
+#
+# For LLM workloads, the startup probe is critical:
+# - Large models (70B+) can take 30+ minutes to load
+# - Default probe timeouts would kill the pod
+# - Startup probe allows extended initialization time
+#
+# Usage:
+#   kubectl apply -f pod-with-probes.yaml
+#   kubectl describe pod pod-with-probes
+#   kubectl get events --sort-by=.metadata.creationTimestamp
+#   kubectl delete pod pod-with-probes
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-with-probes
+  labels:
+    app: nginx
+    demo: probes
+spec:
+  containers:
+  - name: nginx
+    image: nginx:1.25
+    ports:
+    - containerPort: 80
+
+    # Startup Probe: Gives container time to start up
+    # Useful for slow-loading applications like large LLMs
+    startupProbe:
+      httpGet:
+        path: /
+        port: 80
+      # Check every 10 seconds
+      periodSeconds: 10
+      # Timeout after 5 seconds
+      timeoutSeconds: 5
+      # Allow up to 30 failures (30 * 10s = 300 seconds = 5 minutes)
+      # For 70B+ LLM models, increase to 720 (720 * 10s = 2 hours!)
+      failureThreshold: 30
+      # Don't delay first check
+      initialDelaySeconds: 0
+      # Mark as successful after 1 success
+      successThreshold: 1
+
+    # Liveness Probe: Detects if container is hung
+    # If it fails, the container is restarted
+    livenessProbe:
+      httpGet:
+        path: /
+        port: 80
+      # Start checking after container is "ready"
+      periodSeconds: 10
+      timeoutSeconds: 5
+      # Fail after 3 consecutive failures
+      failureThreshold: 3
+      initialDelaySeconds: 5
+      successThreshold: 1
+
+    # Readiness Probe: Controls when traffic is sent
+    # If it fails, pod is removed from service endpoints
+    readinessProbe:
+      httpGet:
+        path: /
+        port: 80
+      periodSeconds: 5
+      timeoutSeconds: 3
+      # Mark not ready after 3 consecutive failures
+      failureThreshold: 3
+      initialDelaySeconds: 5
+      successThreshold: 1
+
+# Probe behavior summary:
+#
+# Startup Probe:
+#   - Runs first
+#   - Disables liveness/readiness until successful
+#   - Extended failure threshold for slow starts
+#   - Only runs once at startup
+#
+# Liveness Probe:
+#   - Detects deadlocks/hangs
+#   - On failure: restart container
+#   - Doesn't affect traffic routing
+#   - Runs continuously
+#
+# Readiness Probe:
+#   - Detects if app can handle traffic
+#   - On failure: remove from service endpoints
+#   - Doesn't restart container
+#   - Runs continuously
+#
+# Example for LLM serving with 2-hour model loading:
+#
+# startupProbe:
+#   httpGet:
+#     path: /health
+#     port: 9090
+#   periodSeconds: 10
+#   failureThreshold: 720  # 720 * 10s = 2 hours

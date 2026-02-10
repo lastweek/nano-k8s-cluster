@@ -1,0 +1,114 @@
+# ConfigMap from File
+#
+# ConfigMaps can be created from files, directories, or literal values.
+# This example shows mounting ConfigMap as files in a volume.
+#
+# Key concepts:
+# - ConfigMap from file: Load config from files on disk
+# - Volume mount: Mount ConfigMap as files in container
+# - Hot reload: File-based ConfigMaps can update without restart
+#
+# For LLM serving:
+# - Store model configuration files (config.json, tokenizer_config.json)
+# - Store prompt templates, system prompts
+# - Store feature flags as TOML/YAML/JSON files
+#
+# Usage:
+#   kubectl apply -f 02-configmap-from-file.yaml
+#   kubectl delete -f 02-configmap-from-file.yaml
+
+---
+# ConfigMap created from file data (embedded)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  labels:
+    app: configmap-volume
+data:
+  # Config files as string data
+  app.conf: |
+    server_port=8080
+    max_connections=1000
+    timeout_seconds=30
+    log_level=info
+
+  model_config.json: |
+    {
+      "model_name": "llama-3-70b",
+      "model_path": "/models/llama-3-70b",
+      "batch_size": 32,
+      "max_tokens": 4096,
+      "generation_config": {
+        "temperature": 0.7,
+        "top_k": 50,
+        "top_p": 0.9,
+        "repetition_penalty": 1.0
+      },
+      "serving_config": {
+        "enable_streaming": true,
+        "enable_cache": true,
+        "cache_size_gb": 4
+      }
+    }
+
+  prompt_template.txt: |
+    You are a helpful AI assistant.
+    Please provide accurate and helpful responses.
+
+    User: {user_input}
+    Assistant:
+
+---
+# Pod mounting ConfigMap as files
+apiVersion: v1
+kind: Pod
+metadata:
+  name: configmap-volume-demo
+  labels:
+    app: configmap-volume
+spec:
+  containers:
+  - name: demo
+    image: nginx:1.25
+    ports:
+    - containerPort: 80
+    volumeMounts:
+    - name: config-volume
+      mountPath: /etc/config
+      readOnly: true
+    # Optional: Set environment variable from file content
+    env:
+    - name: SERVER_PORT
+      valueFrom:
+        configMapKeyRef:
+          name: app-config
+          key: app.conf
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+  volumes:
+  - name: config-volume
+    configMap:
+      name: app-config
+      # Optional: Set file permissions (default 0644)
+      defaultMode: 0444
+      # Optional: Make specific items (uncomment to use)
+      # items:
+      # - key: app.conf
+      #   path: app.conf
+      # - key: model_config.json
+      #   path: models/config.json
+
+# File structure in container:
+# /etc/config/
+#   ├── app.conf
+#   ├── model_config.json
+#   └── prompt_template.txt
+
+# Benefits:
+# - Config files appear as regular files
+# - No code changes to read config
+# - Applications can use normal config file parsing
+# - Updates to ConfigMap propagate to files (with some delay)
