@@ -1,0 +1,81 @@
+# Example 01: Simple LLMCluster (Single Instance)
+#
+# This is the simplest possible LLMCluster deployment.
+# It creates a SINGLE model instance with tensor parallelism.
+#
+# IMPORTANT: This creates ONE model instance.
+# To add capacity, create additional LLMClusters (instances A, B, C...)
+# and use a router to balance across them.
+
+apiVersion: serving.ai/v1alpha1
+kind: LLMCluster
+metadata:
+  name: llama-3-70b-instance-a
+  namespace: default
+  labels:
+    app: llama-3-70b
+    serving.ai/role: instance
+spec:
+  # Model to serve
+  model: meta-llama/Meta-Llama-3-70B
+  modelSize: 70B
+
+  # Scale configuration for THIS INSTANCE
+  replicas: 2       # 2 pods for tensor parallelism
+  gpusPerPod: 4     # Each pod uses 4 GPUs
+  tensorParallelSize: 8  # Total TP = 2 × 4 = 8
+
+  # Inference configuration
+  image: vllm/vllm-openai:latest
+  inferenceEngine: vllm
+
+  # Disable router and queue for single instance
+  router:
+    enabled: false
+  queue:
+    enabled: false
+
+  # Scheduling: run on GPU nodes
+  scheduling:
+    nodeSelector:
+      gpu.node: "true"
+
+# ============================================
+# What gets created:
+# ============================================
+# 1. StatefulSet: llama-3-70b-instance-a (2 pods, 4 GPUs each)
+# 2. Service: llama-3-70b-instance-a-backend (headless)
+# 3. Service: llama-3-70b-instance-a (external access)
+# 4. Pods: llama-3-70b-instance-a-0, llama-3-70b-instance-a-1
+#
+# Architecture:
+#   ┌─────────────────────────────────────────┐
+#   │  Instance A (Single LLMCluster)          │
+#   │  ┌─────────────────────────────────┐    │
+#   │  │ Pod-0 (rank 0)                  │    │
+#   │  │ 4x GPUs, receives requests     │    │
+#   │  └─────────────────────────────────┘    │
+#   │  ┌─────────────────────────────────┐    │
+#   │  │ Pod-1 (rank 1)                  │    │
+#   │  │ 4x GPUs, TP worker only         │    │
+#   │  └─────────────────────────────────┘    │
+#   │              │                           │
+#   │         TP = 8 (2×4 GPUs)               │
+#   └─────────────────────────────────────────┘
+#
+# Access (direct to this instance):
+#   kubectl port-forward svc/llama-3-70b-instance-a 8000:8000
+#   curl http://localhost:8000/v1/completions \
+#     -H "Content-Type: application/json" \
+#     -d '{"model":"meta-llama/Meta-Llama-3-70B","prompt":"Hello","max_tokens":10}'
+#
+# ============================================
+# To Scale (Add Capacity):
+# ============================================
+# Create additional LLMClusters:
+#   - llama-3-70b-instance-b
+#   - llama-3-70b-instance-c
+#   - etc.
+#
+# Then use a router (see example 04) to balance across instances.
+# DO NOT scale by increasing replicas - that would break TP!

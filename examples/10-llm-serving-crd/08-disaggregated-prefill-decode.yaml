@@ -1,0 +1,455 @@
+# Disaggregated Prefill/Decode LLM Serving
+#
+# This example shows how to deploy a disaggregated LLM serving architecture
+# where prefill and decode are handled by separate LLMCluster instances.
+#
+# Architecture:
+# ┌────────────────────────────────────────────────────────────────────┐
+# │  Client Request                                                │
+# │       │                                                        │
+# │       ▼                                                        │
+# │  ┌──────────────────────────────────────────────────────────────┐    │
+# │  │ Prefill-Decode Router                                      │    │
+# │  │  - Routes prefill phase to prefill clusters           │    │
+# │  │  - Routes decode phase to decode clusters               │    │
+# │  │  - Manages KV cache transfer between phases              │    │
+# │  └──────────────────────────────────────────────────────────────┘    │
+# │       │                                                        │
+# │       ├───┬─────────────────────────────────────────────────┐     │
+# │       │    │                                                 │     │
+# │       ▼    ▼                                                 ▼     │
+# │  ┌──────────┐  ┌──────────┐      ┌──────────┐  ┌──────────┐  │
+# │  │ Prefill   │  │ Prefill   │  ...  │ Decode   │  │ Decode   │  │
+# │  │ Cluster A │  │ Cluster B │      │ Cluster 1│  │ Cluster 2│  │
+# │  │ (TP-8)   │  │ (TP-8)   │      │ (TP-4)   │  │ (TP-4)   │  │
+# │  └──────────┘  └──────────┘      └──────────┘  └──────────┘  │
+# │       │            │                   │            │            │  │
+# │       └────────────┴───────────────────┴────────────┘            │  │
+# │             Prefill transfers KV to Decode via side-channel           │  │
+# └────────────────────────────────────────────────────────────────────────────┘
+#
+# Benefits:
+# - Independent scaling: Scale prefill and decode separately
+# - Speculative decoding: Decode clusters can use different sampling strategies
+# - Resource optimization: Prefill needs more compute, decode needs more memory bandwidth
+# - Heterogeneous hardware: Prefill on GPU, decode on CPU/other accelerators
+
+---
+# ============================================
+# PREFILL CLUSTERS
+# ============================================
+# Prefill clusters handle the prompt processing phase.
+# They compute KV cache for the prompt and transfer it to decode clusters.
+
+# Prefill Cluster A
+apiVersion: serving.ai/v1alpha1
+kind: LLMCluster
+metadata:
+  name: llama-3-70b-prefill-00
+  namespace: default
+  labels:
+    app: llama-3-70b
+    role: prefill
+    cluster-id: "00"
+spec:
+  model: meta-llama/Meta-Llama-3-70B
+  modelSize: 70B
+
+  # Prefill: 2 pods with 4 GPUs each = TP-8
+  replicas: 2
+  gpusPerPod: 4
+  tensorParallelSize: 8
+
+  image: vllm/vllm-openai:latest
+  inferenceEngine: vllm
+
+  # Prefill-specific arguments
+  inferenceArgs:
+    maxModelLen: 4096
+    blockSize: 16
+    dtype: half
+    gpuMemoryUtilization: 0.95
+    # Enable prefill mode
+    prefillOnly: true  # Custom vLLM flag for prefill-only mode
+    # Output KV cache to shared storage or side-channel
+    kvCacheTransferMode: "side-channel"  # Options: side-channel, shared-memory, redis
+
+  resources:
+    requests:
+      cpu: "32"      # Prefill is CPU-intensive
+      memory: "128Gi"
+    limits:
+      memory: "256Gi"
+
+  router:
+    enabled: false  # Prefill clusters don't need router
+
+  queue:
+    enabled: false
+
+  storage:
+    shmSize: 32Gi    # Larger shared memory for KV cache transfer
+
+  scheduling:
+    nodeSelector:
+      gpu.node: "true"
+      gpu.type: "h100"  # Prefill benefits from fast GPUs
+    podAntiAffinity: Required
+
+  highAvailability:
+    podDisruptionBudget:
+      enabled: true
+      minAvailable: 1
+    terminationGracePeriodSeconds: 300  # Shorter drain for prefill
+
+---
+# Prefill Cluster B (identical configuration)
+apiVersion: serving.ai/v1alpha1
+kind: LLMCluster
+metadata:
+  name: llama-3-70b-prefill-01
+  namespace: default
+  labels:
+    app: llama-3-70b
+    role: prefill
+    cluster-id: "01"
+spec:
+  model: meta-llama/Meta-Llama-3-70B
+  modelSize: 70B
+  replicas: 2
+  gpusPerPod: 4
+  tensorParallelSize: 8
+  image: vllm/vllm-openai:latest
+  inferenceEngine: vllm
+  inferenceArgs:
+    maxModelLen: 4096
+    blockSize: 16
+    dtype: half
+    gpuMemoryUtilization: 0.95
+    prefillOnly: true
+    kvCacheTransferMode: "side-channel"
+  resources:
+    requests:
+      cpu: "32"
+      memory: "128Gi"
+    limits:
+      memory: "256Gi"
+  router:
+    enabled: false
+  queue:
+    enabled: false
+  storage:
+    shmSize: 32Gi
+  scheduling:
+    nodeSelector:
+      gpu.node: "true"
+      gpu.type: "h100"
+    podAntiAffinity: Required
+  highAvailability:
+    podDisruptionBudget:
+      enabled: true
+      minAvailable: 1
+    terminationGracePeriodSeconds: 300
+
+---
+# ============================================
+# DECODE CLUSTERS
+# ============================================
+# Decode clusters handle the token generation phase.
+# They receive KV cache from prefill clusters and generate output tokens.
+
+# Decode Cluster 1
+apiVersion: serving.ai/v1alpha1
+kind: LLMCluster
+metadata:
+  name: llama-3-70b-decode-00
+  namespace: default
+  labels:
+    app: llama-3-70b
+    role: decode
+    cluster-id: "00"
+spec:
+  model: meta-llama/Meta-Llama-3-70B
+  modelSize: 70B
+
+  # Decode: 2 pods with 2 GPUs each = TP-4
+  # Decode can use smaller TP because it only generates tokens
+  replicas: 2
+  gpusPerPod: 2
+  tensorParallelSize: 4
+
+  image: vllm/vllm-openai:latest
+  inferenceEngine: vllm
+
+  # Decode-specific arguments
+  inferenceArgs:
+    maxModelLen: 4096
+    blockSize: 16
+    dtype: half
+    gpuMemoryUtilization: 0.9
+    # Enable decode mode
+    decodeOnly: true  # Custom vLLM flag for decode-only mode
+    # Input KV cache from side-channel
+    kvCacheTransferMode: "side-channel"
+    # Speculative decoding configuration
+    speculativeDecoding:
+      enabled: true
+      numSpeculativeTokens: 5  # Generate 5 candidates per token
+      samplingStrategy: "beam"  # Options: beam, multinomial, greedy
+
+  resources:
+    requests:
+      cpu: "16"      # Decode needs less CPU than prefill
+      memory: "64Gi"
+    limits:
+      memory: "128Gi"
+
+  router:
+    enabled: false  # Router handles traffic routing
+
+  queue:
+    enabled: false
+
+  storage:
+    shmSize: 16Gi    # Smaller shared memory for decode
+
+  scheduling:
+    nodeSelector:
+      gpu.node: "true"
+      gpu.memory: "high-bandwidth"  # Decode benefits from high memory bandwidth
+    podAntiAffinity: Required
+
+  highAvailability:
+    podDisruptionBudget:
+      enabled: true
+      minAvailable: 1
+    terminationGracePeriodSeconds: 600  # Longer drain for decode (in-flight requests)
+
+---
+# Decode Cluster 2 (identical configuration)
+apiVersion: serving.ai/v1alpha1
+kind: LLMCluster
+metadata:
+  name: llama-3-70b-decode-01
+  namespace: default
+  labels:
+    app: llama-3-70b
+    role: decode
+    cluster-id: "01"
+spec:
+  model: meta-llama/Meta-Llama-3-70B
+  modelSize: 70B
+  replicas: 2
+  gpusPerPod: 2
+  tensorParallelSize: 4
+  image: vllm/vllm-openai:latest
+  inferenceEngine: vllm
+  inferenceArgs:
+    maxModelLen: 4096
+    blockSize: 16
+    dtype: half
+    gpuMemoryUtilization: 0.9
+    decodeOnly: true
+    kvCacheTransferMode: "side-channel"
+    speculativeDecoding:
+      enabled: true
+      numSpeculativeTokens: 5
+      samplingStrategy: "beam"
+  resources:
+    requests:
+      cpu: "16"
+      memory: "64Gi"
+    limits:
+      memory: "128Gi"
+  router:
+    enabled: false
+  queue:
+    enabled: false
+  storage:
+    shmSize: 16Gi
+  scheduling:
+    nodeSelector:
+      gpu.node: "true"
+      gpu.memory: "high-bandwidth"
+    podAntiAffinity: Required
+  highAvailability:
+    podDisruptionBudget:
+      enabled: true
+      minAvailable: 1
+      terminationGracePeriodSeconds: 600
+
+---
+# ============================================
+# PREFILL-DECODE ROUTER
+# ============================================
+# The router orchestrates the two-phase serving:
+# 1. Route request to prefill cluster
+# 2. Transfer KV cache from prefill to decode
+# 3. Route decode phase to decode cluster
+# 4. Stream tokens back to client
+
+apiVersion: serving.ai/v1alpha1
+kind: LLMCluster
+metadata:
+  name: llama-3-70b-prefill-decode-router
+  namespace: default
+  labels:
+    app: llama-3-70b
+    role: router
+spec:
+  model: none  # Router-only cluster
+
+  router:
+    enabled: true
+    replicas: 3
+    type: prefill-decode  # Custom router type for two-phase serving
+
+    # Prefill backends
+    prefillBackends:
+    - name: prefill-00
+      service: llama-3-70b-prefill-00
+      port: 8000
+      weight: 100  # Load balancing weight
+
+    - name: prefill-01
+      service: llama-3-70b-prefill-01
+      port: 8000
+      weight: 100
+
+    # Decode backends
+    decodeBackends:
+    - name: decode-00
+      service: llama-3-70b-decode-00
+      port: 8000
+      weight: 100
+
+    - name: decode-01
+      service: llama-3-70b-decode-01
+      port: 8000
+      weight: 100
+
+    # KV cache transfer configuration
+    kvCacheTransfer:
+      enabled: true
+      mode: side-channel  # Options: side-channel, shared-memory, redis
+      timeout: 5s  # Max time to transfer KV cache
+
+    # Routing strategy
+    routingStrategy:
+      type: affinity  # Options: affinity, round-robin, least-connections
+      # Sticky routing: same decode cluster for follow-up requests from same client
+      stickyRouting:
+        enabled: true
+        timeout: 300s  # Maintain affinity for 5 minutes
+
+    # Prefill-decode coordination
+    coordination:
+      enabled: true
+      mode: two-phase  # Explicit prefill then decode
+      # Max concurrent prefill requests per decode cluster
+      maxPrefillPerDecode: 2
+      # Queue decode requests if prefill is busy
+      decodeQueueing:
+        enabled: true
+        maxQueueSize: 100
+
+  # Router autoscaling (HPA - VALID)
+  router:
+    autoscaling:
+      enabled: true
+      minReplicas: 3
+      maxReplicas: 10
+      targetCPUUtilizationPercentage: 70
+
+  # Queue for pending decode requests
+  queue:
+    enabled: true
+    replicas: 1
+    backend: redis
+    capacity: 1000
+    # Separate queue for prefill completion
+    decodePendingQueue: true
+
+  monitoring:
+    enabled: true
+    prometheus: true
+    grafana: true
+    # Additional metrics for prefill-decode
+    metrics:
+      prefillLatency: true
+      decodeLatency: true
+      kvCacheTransferTime: true
+      endToEndLatency: true
+
+  network:
+    serviceType: LoadBalancer
+    port: 8000
+    networkPolicy: true
+
+# ============================================
+# DEPLOYMENT INSTRUCTIONS
+# ============================================
+#
+# 1. Apply prefill clusters:
+#    kubectl apply -f 08-disaggregated-prefill-decode.yaml
+#
+# 2. Verify prefill clusters are ready:
+#    kubectl get llmc -l role=prefill
+#    kubectl describe llmc llama-3-70b-prefill-00
+#
+# 3. Apply decode clusters:
+#    kubectl apply -f 08-disaggregated-prefill-decode.yaml
+#    (same file, decode clusters are in same file)
+#
+# 4. Verify decode clusters are ready:
+#    kubectl get llmc -l role=decode
+#
+# 5. Test router:
+#    kubectl port-forward svc/llama-3-70b-prefill-decode-router 8000:8000
+#    curl http://localhost:8000/v1/completions \
+#      -H "Content-Type: application/json" \
+#      -d '{
+#        "model": "meta-llama/Meta-Llama-3-70B",
+#        "prompt": "Explain Kubernetes",
+#        "max_tokens": 50
+#      }'
+#
+# ============================================
+# ARCHITECTURE NOTES
+# ============================================
+#
+# Scaling Behavior:
+# ┌────────────────────────────────────────────────────────────────┐
+# │  Prefill Scaling                                         │
+# │  ┌──────────────────────────────────────────────────────┐     │
+# │  │ Scale-up: When prefill queue depth > threshold    │     │
+# │  │ Scale-down: When prefill utilization < threshold    │     │
+# │  │                                                         │     │
+# │  │ Pre-filter clusters handle prompt processing        │     │
+# │  │ More prefill clusters = higher prompt throughput    │     │
+# │  └──────────────────────────────────────────────────────┘     │
+# └────────────────────────────────────────────────────────────────┘
+#
+# ┌────────────────────────────────────────────────────────────────┐
+# │  Decode Scaling                                          │
+# │  ┌──────────────────────────────────────────────────────┐     │
+# │  │ Scale-up: When decode latency > threshold           │     │
+# │  │ Scale-down: When decode utilization < threshold      │     │
+# │  │                                                         │     │
+# │  │ Decode clusters handle token generation           │     │
+# │  │ More decode clusters = higher token throughput       │     │
+# │  │                                                         │     │
+# │  │ Can use different TP sizes (TP-4 vs TP-8)      │     │
+# │  │ Smaller TP = faster decode, less memory               │     │
+# │  └──────────────────────────────────────────────────────┘     │
+# └────────────────────────────────────────────────────────────────┘
+#
+# Speculative Decoding:
+# - Decode clusters can generate multiple token candidates per step
+# - Reduces total number of decode steps needed
+# - Requires more memory for candidate tracking
+#
+# Heterogeneous Deployment:
+# - Prefill on H100 (fast compute, high memory bandwidth)
+# - Decode on L40 or other inference-optimized GPUs
+# - Or: Prefill on GPU, Decode on CPU with optimized kernels

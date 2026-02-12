@@ -1,0 +1,265 @@
+# Example 03: Multi-Instance LLMCluster with Autoscaling
+#
+# IMPORTANT: HPA for StatefulSets with TP does NOT work!
+# Adding replicas to a TP StatefulSet breaks the tensor parallelism configuration.
+#
+# CORRECT APPROACH:
+# - Router HPA: Valid (router is a Deployment)
+# - Backend scaling: Manual (create new LLMClusters)
+#
+# This example shows:
+# - Multiple LLMCluster instances
+# - Router with HPA (autoscales router pods)
+# - Manual backend scaling guide
+
+---
+# ============================================
+# INSTANCE A
+# ============================================
+
+apiVersion: serving.ai/v1alpha1
+kind: LLMCluster
+metadata:
+  name: llama-3-70b-instance-a
+  namespace: default
+  labels:
+    app: llama-3-70b
+    instance: a
+    serving.ai/role: instance
+spec:
+  model: meta-llama/Meta-Llama-3-70B
+  modelSize: 70B
+
+  # Fixed TP configuration - DO NOT CHANGE
+  replicas: 2       # 2 pods for TP
+  gpusPerPod: 4     # 4 GPUs per pod
+  tensorParallelSize: 8  # TP = 2 × 4 = 8
+
+  image: vllm/vllm-openai:latest
+  inferenceEngine: vllm
+
+  inferenceArgs:
+    maxModelLen: 4096
+    blockSize: 8
+    dtype: half
+    gpuMemoryUtilization: 0.9
+
+  resources:
+    requests:
+      cpu: "16"
+      memory: "64Gi"
+    limits:
+      memory: "128Gi"
+
+  # No router per instance
+  router:
+    enabled: false
+  queue:
+    enabled: false
+
+  storage:
+    shmSize: 16Gi
+
+  scheduling:
+    nodeSelector:
+      gpu.node: "true"
+    podAntiAffinity: Required
+
+  highAvailability:
+    podDisruptionBudget:
+      enabled: true
+      minAvailable: 1
+    terminationGracePeriodSeconds: 600
+
+---
+# ============================================
+# INSTANCE B
+# ============================================
+
+apiVersion: serving.ai/v1alpha1
+kind: LLMCluster
+metadata:
+  name: llama-3-70b-instance-b
+  namespace: default
+  labels:
+    app: llama-3-70b
+    instance: b
+    serving.ai/role: instance
+spec:
+  model: meta-llama/Meta-Llama-3-70B
+  modelSize: 70B
+
+  # Same TP configuration
+  replicas: 2
+  gpusPerPod: 4
+  tensorParallelSize: 8
+
+  image: vllm/vllm-openai:latest
+  inferenceEngine: vllm
+
+  inferenceArgs:
+    maxModelLen: 4096
+    blockSize: 8
+    dtype: half
+    gpuMemoryUtilization: 0.9
+
+  resources:
+    requests:
+      cpu: "16"
+      memory: "64Gi"
+    limits:
+      memory: "128Gi"
+
+  router:
+    enabled: false
+  queue:
+    enabled: false
+
+  storage:
+    shmSize: 16Gi
+
+  scheduling:
+    nodeSelector:
+      gpu.node: "true"
+    podAntiAffinity: Required
+
+  highAvailability:
+    podDisruptionBudget:
+      enabled: true
+      minAvailable: 1
+    terminationGracePeriodSeconds: 600
+
+---
+# ============================================
+# SHARED ROUTER with HPA
+# ============================================
+
+apiVersion: serving.ai/v1alpha1
+kind: LLMCluster
+metadata:
+  name: llama-3-70b-router
+  namespace: default
+spec:
+  model: none  # Router-only cluster
+
+  # Router configuration
+  router:
+    enabled: true
+    replicas: 2           # Initial router pods
+    type: nginx
+    # Backends to balance across
+    backends:
+    - name: instance-a
+      service: llama-3-70b-instance-a
+      port: 8000
+    - name: instance-b
+      service: llama-3-70b-instance-b
+      port: 8000
+    # Router autoscaling (HPA - VALID!)
+    autoscaling:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 10
+      targetCPUUtilizationPercentage: 70
+
+  # Queue configuration
+  queue:
+    enabled: true
+    replicas: 2
+    backend: redis
+    capacity: 1000
+
+  # Monitoring
+  monitoring:
+    enabled: true
+    prometheus: true
+    grafana: true
+    dcgmExporter: true
+
+  network:
+    serviceType: LoadBalancer
+    port: 8000
+    networkPolicy: true
+
+# ============================================
+# What gets created:
+# ============================================
+# Instance A & B:
+#   1. StatefulSet: llama-3-70b-instance-{a,b} (2 pods each, TP=8)
+#   2. Service: llama-3-70b-instance-{a,b} (external access)
+#   3. PodDisruptionBudget (minAvailable: 1)
+#
+# Router:
+#   1. Deployment: llama-3-70b-router (nginx)
+#   2. Deployment: llama-3-70b-router-queue (redis)
+#   3. HorizontalPodAutoscaler: llama-3-70b-router-hpa
+#     - Scales router pods: 2 → 10 based on CPU
+#   4. Service: llama-3-70b-router (LoadBalancer)
+#   5. Deployments: prometheus, grafana, dcgm-exporter
+#   6. ConfigMaps, Services for monitoring stack
+#
+# ============================================
+# Autoscaling Behavior:
+# ============================================
+#
+# ┌─────────────────────────────────────────────────────────────┐
+# │  Router Autoscaling (HPA - Valid)                          │
+# │  ┌───────────────────────────────────────────────────────┐  │
+# │  │ Trigger: Router CPU > 70%                             │  │
+# │  │                                                         │  │
+# │  │ Action: Add router pods (2 → 10 max)                  │  │
+# │  │                                                         │  │
+# │  │ Downtime: Zero! Router is a Deployment                │  │
+# │  └───────────────────────────────────────────────────────┘  │
+# └─────────────────────────────────────────────────────────────┘
+#
+# ┌─────────────────────────────────────────────────────────────┐
+# │  Backend Instance Scaling (CRD Fleet Autoscaler)             │
+# │  ┌───────────────────────────────────────────────────────┐  │
+# │  │ HPA for StatefulSet with TP = BROKEN!                  │  │
+# │  │                                                         │  │
+# │  │ If HPA scales 2 → 4 pods:                             │  │
+# │  │   - TP was configured for 2 pods (TP=8)               │  │
+# │  │   - Now 4 pods exist!                                 │  │
+# │  │   - TP must be recalculated to TP=16                  │  │
+# │  │   - Model restart required!                           │  │
+# │  │                                                         │  │
+# │  │ Solution: Scale by creating new LLMClusters via        │  │
+# │  │           LLMClusterAutoscaler policy + reconcile loop │  │
+# │  └───────────────────────────────────────────────────────┘  │
+# └─────────────────────────────────────────────────────────────┘
+#
+# ============================================
+# How to Scale Backend Instances:
+# ============================================
+#
+# 1) Apply autoscaler policy and CRD:
+#    kubectl apply -f 06-example-with-crd-autoscaler.yaml
+#
+# 2) Deploy autoscaler controller (production path):
+#    kubectl apply -f 07-operator-deployment.yaml
+#
+# 3) Watch instance CRs:
+#    kubectl get llmc -l app=llama-3-70b,serving.ai/role=instance -w
+#
+# 4) Router backends are reconciled by patching:
+#    llmcluster/llama-3-70b-router spec.router.backends
+#
+# ============================================
+# Access and Monitoring:
+# ============================================
+#
+# Service:
+#   kubectl get svc llama-3-70b-router  # Get LoadBalancer IP
+#
+# Metrics:
+#   kubectl port-forward svc/prometheus 9090:9090
+#   kubectl port-forward svc/grafana 3000:3000
+#
+# Router HPA Status:
+#   kubectl get hpa
+#   kubectl describe hpa llama-3-70b-router-hpa
+#
+# LLMCluster Status:
+#   kubectl get llmc -L app,instance
+#   kubectl describe llmc llama-3-70b-instance-a

@@ -1,0 +1,988 @@
+# LLMCluster Custom Resource Definition
+#
+# This CRD defines a high-level API for deploying multi-node LLM serving clusters.
+# Instead of managing StatefulSets, Services, ConfigMaps, etc. separately,
+# users can create a single LLMCluster resource.
+#
+# The operator (controller) will:
+# 1. Reconcile the desired state
+# 2. Create all necessary K8s resources
+# 3. Handle scaling, updates, and failures
+# 4. Report status back to the LLMCluster resource
+
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: llmclusters.serving.ai
+  annotations:
+    description: "Defines a multi-node LLM serving cluster with autoscaling, monitoring, and HA"
+spec:
+  group: serving.ai
+  names:
+    plural: llmclusters
+    singular: llmcluster
+    kind: LLMCluster
+    shortNames:
+    - llm
+    - llmc
+  scope: Namespaced
+  versions:
+  - name: v1alpha1
+    served: true
+    storage: true
+    subresources:
+      status: {}
+      scale:
+        specReplicasPath: .spec.replicas
+        statusReplicasPath: .status.replicas
+    schema:
+      openAPIV3Schema:
+        type: object
+        description: "LLMCluster defines a multi-node LLM serving deployment"
+        properties:
+          spec:
+            type: object
+            description: "Desired state of the LLM cluster"
+            required:
+            - model
+            - replicas
+            - gpusPerPod
+            properties:
+              # ============================================
+              # MODEL CONFIGURATION
+              # ============================================
+              model:
+                type: string
+                description: "Model name (e.g., meta-llama/Meta-Llama-3-70B)"
+                example: "meta-llama/Meta-Llama-3-70B"
+
+              modelSize:
+                type: string
+                description: "Model size for validation (e.g., 70B, 8B)"
+                enum: ["8B", "13B", "70B", "405B"]
+                example: "70B"
+
+              # ============================================
+              # SCALE CONFIGURATION
+              # ============================================
+              replicas:
+                type: integer
+                description: "Number of model pods (each with gpusPerPod GPUs)"
+                minimum: 1
+                maximum: 32
+                default: 2
+                example: 2
+
+              gpusPerPod:
+                type: integer
+                description: "Number of GPUs per pod (for tensor parallelism)"
+                minimum: 1
+                maximum: 8
+                default: 4
+                example: 4
+
+              tensorParallelSize:
+                type: integer
+                description: "Total TP size (replicas × gpusPerPod)"
+                minimum: 1
+                default: 8
+                example: 8
+
+              # ============================================
+              # INFERENCE CONFIGURATION
+              # ============================================
+              image:
+                type: string
+                description: "Container image for inference"
+                default: "vllm/vllm-openai:latest"
+                example: "vllm/vllm-openai:latest"
+
+              inferenceEngine:
+                type: string
+                description: "Inference engine to use"
+                enum: ["vllm", "trt-llm", "transformers", "custom"]
+                default: "vllm"
+                example: "vllm"
+
+              inferenceArgs:
+                type: object
+                description: "Additional arguments for the inference engine"
+                properties:
+                  maxModelLen:
+                    type: integer
+                    description: "Maximum context length"
+                    default: 4096
+
+                  blockSize:
+                    type: integer
+                    description: "Block size for KV cache"
+                    default: 8
+
+                  dtype:
+                    type: string
+                    description: "Data type for inference"
+                    enum: ["half", "bfloat16", "float16"]
+                    default: "half"
+
+                  gpuMemoryUtilization:
+                    type: number
+                    description: "GPU memory utilization fraction (0.0-1.0)"
+                    minimum: 0.1
+                    maximum: 1.0
+                    default: 0.9
+
+                  # ============================================
+                  # PREFILL/DECODE CONFIGURATION
+                  # ============================================
+                  prefillOnly:
+                    type: boolean
+                    description: "Enable prefill-only mode (compute KV cache, no token generation)"
+                    default: false
+
+                  decodeOnly:
+                    type: boolean
+                    description: "Enable decode-only mode (generate tokens, receive KV cache as input)"
+                    default: false
+
+                  kvCacheTransferMode:
+                    type: string
+                    description: "How KV cache is transferred from prefill to decode"
+                    enum: ["side-channel", "shared-memory", "redis", "none"]
+                    default: "none"
+
+                  speculativeDecoding:
+                    type: object
+                    description: "Speculative decoding configuration (decode-only clusters)"
+                    properties:
+                      enabled:
+                        type: boolean
+                        description: "Enable speculative decoding (multiple token candidates per step)"
+                        default: false
+
+                      numSpeculativeTokens:
+                        type: integer
+                        description: "Number of speculative tokens to generate per step"
+                        minimum: 1
+                        maximum: 10
+                        default: 5
+
+                      samplingStrategy:
+                        type: string
+                        description: "Strategy for selecting best speculative token"
+                        enum: ["greedy", "multinomial", "beam"]
+                        default: "greedy"
+
+              # ============================================
+              # RESOURCE CONFIGURATION
+              # ============================================
+              resources:
+                type: object
+                description: "Resource requests and limits"
+                properties:
+                  requests:
+                    type: object
+                    properties:
+                      cpu:
+                        type: string
+                        description: "CPU request per pod"
+                        default: "16"
+
+                      memory:
+                        type: string
+                        description: "Memory request per pod"
+                        default: "64Gi"
+
+                  limits:
+                    type: object
+                    properties:
+                      memory:
+                        type: string
+                        description: "Memory limit per pod"
+                        default: "128Gi"
+
+              # ============================================
+              # ROUTER CONFIGURATION
+              # ============================================
+              # IMPORTANT: Router balances ACROSS LLMCluster instances,
+              # not within a single instance's pods!
+              router:
+                type: object
+                description: "Router/load balancer configuration"
+                properties:
+                  enabled:
+                    type: boolean
+                    default: true
+                    description: "Enable router layer"
+
+                  replicas:
+                    type: integer
+                    minimum: 1
+                    maximum: 10
+                    default: 2
+                    description: "Number of router replicas"
+
+                  image:
+                    type: string
+                    default: "nginx:alpine"
+                    description: "Router image"
+
+                  type:
+                    type: string
+                    enum: ["nginx", "envoy", "prefill-decode", "custom"]
+                    default: "nginx"
+                    description: "Router implementation (prefill-decode for two-phase serving)"
+
+                  backends:
+                    type: array
+                    description: "Backend LLMCluster instances to balance across"
+                    items:
+                      type: object
+                      required:
+                      - name
+                      - service
+                      properties:
+                        name:
+                          type: string
+                          description: "Name of the backend instance"
+                          example: "instance-a"
+
+                        service:
+                          type: string
+                          description: "Kubernetes service name for the backend"
+                          example: "llama-3-70b-instance-a"
+
+                        port:
+                          type: integer
+                          default: 8000
+                          description: "Port of the backend service"
+
+                  autoscaling:
+                    type: object
+                    description: "Router autoscaling configuration (HPA for Deployment)"
+                    properties:
+                      enabled:
+                        type: boolean
+                        default: false
+                        description: "Enable HPA for router pods"
+
+                      minReplicas:
+                        type: integer
+                        minimum: 1
+                        default: 2
+                        description: "Minimum router replicas"
+
+                      maxReplicas:
+                        type: integer
+                        minimum: 1
+                        default: 10
+                        description: "Maximum router replicas"
+
+                      targetCPUUtilizationPercentage:
+                        type: integer
+                        minimum: 1
+                        maximum: 100
+                        default: 70
+                        description: "Target CPU utilization percentage"
+
+                  # ============================================
+                  # PREFILL-DECODE SPECIFIC FIELDS
+                  # ============================================
+                  prefillBackends:
+                    type: array
+                    description: "Prefill backend LLMCluster instances (for prefill-decode routers)"
+                    items:
+                      type: object
+                      required:
+                      - name
+                      - service
+                      properties:
+                        name:
+                          type: string
+                          description: "Name of prefill backend instance"
+                          example: "prefill-00"
+
+                        service:
+                          type: string
+                          description: "Kubernetes service name for prefill backend"
+                          example: "llama-3-70b-prefill-00"
+
+                        port:
+                          type: integer
+                          default: 8000
+                          description: "Port of the prefill backend service"
+
+                        weight:
+                          type: integer
+                          default: 100
+                          description: "Load balancing weight for this prefill backend"
+
+                  decodeBackends:
+                    type: array
+                    description: "Decode backend LLMCluster instances (for prefill-decode routers)"
+                    items:
+                      type: object
+                      required:
+                      - name
+                      - service
+                      properties:
+                        name:
+                          type: string
+                          description: "Name of decode backend instance"
+                          example: "decode-00"
+
+                        service:
+                          type: string
+                          description: "Kubernetes service name for decode backend"
+                          example: "llama-3-70b-decode-00"
+
+                        port:
+                          type: integer
+                          default: 8000
+                          description: "Port of the decode backend service"
+
+                        weight:
+                          type: integer
+                          default: 100
+                          description: "Load balancing weight for this decode backend"
+
+                  kvCacheTransfer:
+                    type: object
+                    description: "KV cache transfer configuration from prefill to decode"
+                    properties:
+                      enabled:
+                        type: boolean
+                        default: false
+                        description: "Enable KV cache transfer from prefill to decode"
+
+                      mode:
+                        type: string
+                        enum: ["side-channel", "shared-memory", "redis", "nvidia-pe"]
+                        default: "side-channel"
+                        description: "Transfer mechanism"
+
+                      timeout:
+                        type: integer
+                        default: 5
+                        minimum: 1
+                        maximum: 60
+                        description: "Max time to transfer KV cache (seconds)"
+
+                  coordination:
+                    type: object
+                    description: "Prefill-decode coordination configuration"
+                    properties:
+                      enabled:
+                        type: boolean
+                        default: false
+                        description: "Enable two-phase prefill then decode coordination"
+
+                      mode:
+                        type: string
+                        enum: ["two-phase", "pipelined", "batched"]
+                        default: "two-phase"
+                        description: "Coordination mode"
+
+                      maxPrefillPerDecode:
+                        type: integer
+                        default: 2
+                        minimum: 1
+                        maximum: 10
+                        description: "Max concurrent prefill requests per decode cluster"
+
+                      decodeQueueing:
+                        type: object
+                        properties:
+                          enabled:
+                            type: boolean
+                            default: false
+                            description: "Queue decode requests if prefill is busy"
+
+                          maxQueueSize:
+                            type: integer
+                            default: 100
+                            description: "Max pending decode requests"
+
+                  routingStrategy:
+                    type: object
+                    description: "Request routing strategy for prefill-decode"
+                    properties:
+                      type:
+                        type: string
+                        enum: ["affinity", "round-robin", "least-connections"]
+                        default: "affinity"
+                        description: "Routing algorithm"
+
+                      stickyRouting:
+                        type: object
+                        properties:
+                          enabled:
+                            type: boolean
+                            default: true
+                            description: "Route follow-up requests to same decode cluster"
+
+                          timeout:
+                            type: integer
+                            default: 300
+                            minimum: 30
+                            maximum: 3600
+                            description: "How long to maintain affinity (seconds)"
+
+              # ============================================
+              # QUEUE CONFIGURATION
+              # ============================================
+              queue:
+                type: object
+                description: "Request queue configuration"
+                properties:
+                  enabled:
+                    type: boolean
+                    default: true
+                    description: "Enable request queue"
+
+                  replicas:
+                    type: integer
+                    minimum: 1
+                    maximum: 5
+                    default: 2
+                    description: "Number of queue replicas"
+
+                  backend:
+                    type: string
+                    enum: ["redis", "rabbitmq", "custom"]
+                    default: "redis"
+                    description: "Queue backend"
+
+                  capacity:
+                    type: integer
+                    description: "Maximum queue size"
+                    default: 1000
+
+              # ============================================
+              # AUTOSCALING CONFIGURATION
+              # ============================================
+              # IMPORTANT: HPA for StatefulSets with TP is NOT supported!
+              # Adding replicas to a TP StatefulSet breaks the tensor parallelism.
+              # Use router.autoscaling for router pods, or create new LLMClusters for capacity.
+              autoscaling:
+                type: object
+                description: "WARNING: NOT SUPPORTED for StatefulSets with TP! Use router.autoscaling instead."
+                deprecated: true
+                properties:
+                  enabled:
+                    type: boolean
+                    default: false
+                    description: "DEPRECATED: Use router.autoscaling.enabled instead"
+
+                  minReplicas:
+                    type: integer
+                    minimum: 1
+                    default: 2
+                    description: "DEPRECATED: Not supported for TP workloads"
+
+                  maxReplicas:
+                    type: integer
+                    minimum: 1
+                    default: 8
+                    description: "DEPRECATED: Not supported for TP workloads"
+
+                  targetCPUUtilizationPercentage:
+                    type: integer
+                    minimum: 1
+                    maximum: 100
+                    default: 80
+                    description: "DEPRECATED: Not supported for TP workloads"
+
+                  customMetric:
+                    type: object
+                    deprecated: true
+                    description: "DEPRECATED: Not supported for TP workloads"
+                    properties:
+                      name:
+                        type: string
+                        default: "queue_length"
+                        description: "Metric name"
+
+                      target:
+                        type: object
+                        properties:
+                          averageValue:
+                            type: string
+                            default: "100"
+                            description: "Target average value"
+
+              # ============================================
+              # COORDINATION CONFIGURATION
+              # ============================================
+              coordination:
+                type: object
+                description: "Distributed coordination settings"
+                properties:
+                  enabled:
+                    type: boolean
+                    default: true
+                    description: "Enable distributed coordination"
+
+                  leaderElection:
+                    type: boolean
+                    default: true
+                    description: "Enable leader election"
+
+                  podManagementPolicy:
+                    type: string
+                    enum: ["OrderedReady", "Parallel"]
+                    default: "OrderedReady"
+                    description: "StatefulSet pod management policy"
+
+              # ============================================
+              # MONITORING CONFIGURATION
+              # ============================================
+              monitoring:
+                type: object
+                description: "Monitoring and observability"
+                properties:
+                  enabled:
+                    type: boolean
+                    default: false
+                    description: "Enable monitoring stack"
+
+                  prometheus:
+                    type: boolean
+                    default: true
+                    description: "Enable Prometheus scraping"
+
+                  grafana:
+                    type: boolean
+                    default: true
+                    description: "Deploy Grafana dashboard"
+
+                  dcgmExporter:
+                    type: boolean
+                    default: true
+                    description: "Enable DCGM GPU exporter"
+
+              # ============================================
+              # STORAGE CONFIGURATION
+              # ============================================
+              storage:
+                type: object
+                description: "Storage configuration"
+                properties:
+                  shmSize:
+                    type: string
+                    default: "16Gi"
+                    description: "Shared memory size for GPU communication"
+
+                  modelCache:
+                    type: object
+                    description: "Model cache PVC"
+                    properties:
+                      enabled:
+                        type: boolean
+                        default: false
+                        description: "Enable persistent model cache"
+
+                      storageClass:
+                        type: string
+                        default: ""
+                        description: "Storage class for model cache"
+
+                      size:
+                        type: string
+                        default: "100Gi"
+                        description: "Size of model cache"
+
+              # ============================================
+              # SCHEDULING CONFIGURATION
+              # ============================================
+              scheduling:
+                type: object
+                description: "Pod scheduling constraints"
+                properties:
+                  nodeSelector:
+                    type: object
+                    additionalProperties:
+                      type: string
+                    description: "Node selector for pods"
+                    example:
+                      gpu.node: "true"
+                      gpu.type: "h100"
+
+                  podAntiAffinity:
+                    type: string
+                    enum: ["Required", "Preferred", "None"]
+                    default: "Required"
+                    description: "Pod anti-affinity policy"
+
+                  topologySpreadConstraints:
+                    type: array
+                    description: "Topology spread constraints"
+                    items:
+                      type: object
+                      properties:
+                        maxSkew:
+                          type: integer
+                          default: 1
+
+                        topologyKey:
+                          type: string
+                          default: "kubernetes.io/hostname"
+
+                        whenUnsatisfiable:
+                          type: string
+                          enum: ["DoNotSchedule", "ScheduleAnyway"]
+                          default: "DoNotSchedule"
+
+              # ============================================
+              # HIGH AVAILABILITY CONFIGURATION
+              # ============================================
+              highAvailability:
+                type: object
+                description: "High availability settings"
+                properties:
+                  podDisruptionBudget:
+                    type: object
+                    description: "PodDisruptionBudget configuration"
+                    properties:
+                      enabled:
+                        type: boolean
+                        default: true
+                        description: "Enable PDB"
+
+                      minAvailable:
+                        type: integer
+                        minimum: 0
+                        default: 1
+                        description: "Minimum available pods"
+
+                  terminationGracePeriodSeconds:
+                    type: integer
+                    minimum: 30
+                    default: 600
+                    description: "Grace period for pod termination (for connection draining)"
+
+              # ============================================
+              # NETWORK CONFIGURATION
+              # ============================================
+              network:
+                type: object
+                description: "Network configuration"
+                properties:
+                  serviceType:
+                    type: string
+                    enum: ["ClusterIP", "LoadBalancer", "NodePort"]
+                    default: "ClusterIP"
+                    description: "Service type"
+
+                  port:
+                    type: integer
+                    minimum: 1024
+                    maximum: 65535
+                    default: 8000
+                    description: "Service port"
+
+                  networkPolicy:
+                    type: boolean
+                    default: false
+                    description: "Enable network policy"
+
+              # ============================================
+              # SECURITY CONFIGURATION
+              # ============================================
+              security:
+                type: object
+                description: "Security settings"
+                properties:
+                  huggingfaceToken:
+                    type: object
+                    description: "Hugging Face authentication"
+                    properties:
+                      secretName:
+                        type: string
+                        description: "Secret name containing HF token"
+
+                      secretKey:
+                        type: string
+                        default: "token"
+                        description: "Key in the secret"
+
+                  serviceAccountName:
+                    type: string
+                    description: "Custom service account for pods"
+
+          status:
+            type: object
+            description: "Observed state of the LLM cluster"
+            properties:
+              phase:
+                type: string
+                description: "Current phase of the cluster"
+                enum:
+                - Pending
+                - Creating
+                - Running
+                - Scaling
+                - Updating
+                - Failed
+                - Terminating
+                default: Pending
+
+              replicas:
+                type: integer
+                description: "Actual number of ready replicas"
+
+              readyReplicas:
+                type: integer
+                description: "Number of ready replicas"
+
+              conditions:
+                type: array
+                description: "Conditions represent the latest available observations"
+                items:
+                  type: object
+                  required:
+                  - type
+                  - status
+                  properties:
+                    type:
+                      type: string
+                      description: "Type of condition"
+                      enum:
+                      - Ready
+                      - Scaling
+                      - Degraded
+                      - Progressing
+                      - Available
+
+                    status:
+                      type: string
+                      description: "Status of the condition (True, False, Unknown)"
+                      enum: ["True", "False", "Unknown"]
+
+                    reason:
+                      type: string
+                      description: "Reason for the condition's last transition"
+
+                    message:
+                      type: string
+                      description: "Human-readable message indicating details"
+
+                    lastTransitionTime:
+                      type: string
+                      format: date-time
+                      description: "Last time the condition transitioned"
+
+              observedGeneration:
+                type: integer
+                description: "Most recent generation observed by the controller"
+
+              routerURL:
+                type: string
+                description: "URL to access the LLM service"
+
+              endpoints:
+                type: array
+                description: "List of backend endpoints"
+                items:
+                  type: string
+
+              metrics:
+                type: object
+                description: "Cluster metrics"
+                properties:
+                  totalGPUs:
+                    type: integer
+                    description: "Total GPUs in the cluster"
+
+                  queueLength:
+                    type: integer
+                    description: "Current queue length"
+
+                  avgRequestDuration:
+                    type: string
+                    description: "Average request duration"
+
+    additionalPrinterColumns:
+    - name: Model
+      type: string
+      description: "Model name"
+      jsonPath: .spec.model
+    - name: Replicas
+      type: integer
+      description: "Number of replicas"
+      jsonPath: .spec.replicas
+    - name: GPUs
+      type: integer
+      description: "Total GPUs (replicas × gpusPerPod)"
+      jsonPath: .spec.tensorParallelSize
+    - name: Phase
+      type: string
+      description: "Current phase"
+      jsonPath: .status.phase
+    - name: Age
+      type: date
+      description: "Time since creation"
+      jsonPath: .metadata.creationTimestamp
+    - name: Ready
+      type: string
+      description: "Ready replicas"
+      jsonPath: .status.readyReplicas
+
+# Example Usage:
+#
+# ============================================
+# Single Instance (Simple)
+# ============================================
+# apiVersion: serving.ai/v1alpha1
+# kind: LLMCluster
+# metadata:
+#   name: llama-3-70b-instance-a
+# spec:
+#   model: meta-llama/Meta-Llama-3-70B
+#   modelSize: 70B
+#   replicas: 2
+#   gpusPerPod: 4
+#   tensorParallelSize: 8
+#   router:
+#     enabled: false
+#
+# ============================================
+# Multi-Instance with Router (Production)
+# ============================================
+# # Instance A
+# apiVersion: serving.ai/v1alpha1
+# kind: LLMCluster
+# metadata:
+#   name: llama-3-70b-instance-a
+#   labels:
+#     app: llama-3-70b
+#     instance: a
+# spec:
+#   model: meta-llama/Meta-Llama-3-70B
+#   replicas: 2
+#   gpusPerPod: 4
+#   tensorParallelSize: 8
+#   router:
+#     enabled: false
+#
+# ---
+# # Instance B
+# apiVersion: serving.ai/v1alpha1
+# kind: LLMCluster
+# metadata:
+#   name: llama-3-70b-instance-b
+#   labels:
+#     app: llama-3-70b
+#     instance: b
+# spec:
+#   model: meta-llama/Meta-Llama-3-70B
+#   replicas: 2
+#   gpusPerPod: 4
+#   tensorParallelSize: 8
+#   router:
+#     enabled: false
+#
+# ---
+# # Router (balances across instances)
+# apiVersion: serving.ai/v1alpha1
+# kind: LLMCluster
+# metadata:
+#   name: llama-3-70b-router
+# spec:
+#   model: none
+#   router:
+#     enabled: true
+#     replicas: 2
+#     backends:
+#     - name: instance-a
+#       service: llama-3-70b-instance-a
+#     - name: instance-b
+#       service: llama-3-70b-instance-b
+#     autoscaling:
+#       enabled: true
+#       minReplicas: 2
+#       maxReplicas: 10
+
+# ============================================
+# Architecture and Scaling Guide
+# ============================================
+#
+# KEY ARCHITECTURAL PRINCIPLE:
+# Each LLMCluster = ONE model instance with fixed tensor parallelism.
+#
+# ┌─────────────────────────────────────────────────────────────────┐
+# │  Wrong: Scaling by Adding Replicas                             │
+# │  ┌───────────────────────────────────────────────────────────┐  │
+# │  │ LLMCluster: replicas=2 → replicas=4 (via HPA)            │  │
+# │  │                                                           │  │
+# │  │ Problem: TP configured for 2 pods (TP=8)                 │  │
+# │  │          Now 4 pods exist!                               │  │
+# │  │          TP must be TP=16                                │  │
+# │  │          Model restart required!                         │  │
+# │  │                                                           │  │
+# │  │ Result: BROKEN! HPA not supported for StatefulSets with TP│  │
+# │  └───────────────────────────────────────────────────────────┘  │
+# └─────────────────────────────────────────────────────────────────┘
+#
+# ┌─────────────────────────────────────────────────────────────────┐
+# │  Correct: Scaling by Creating New LLMClusters                 │
+# │  ┌───────────────────────────────────────────────────────────┐  │
+# │  │ Instance A: replicas=2, TP=8 (running)                   │  │
+# │  │ Instance B: replicas=2, TP=8 (running)                   │  │
+# │  │ Instance C: replicas=2, TP=8 (add for scale!)            │  │
+# │  │                                                           │  │
+# │  │ Each instance is independent                             │  │
+# │  │ No reconfiguration needed!                               │  │
+# │  │                                                           │  │
+# │  │ Result: Zero-downtime scaling                            │  │
+# │  └───────────────────────────────────────────────────────────┘  │
+# └─────────────────────────────────────────────────────────────────┘
+#
+# Scaling Recommendations:
+#
+# 1. Router Autoscaling (HPA - VALID):
+#    - Router is a Deployment, can be autoscaled
+#    - Use router.autoscaling.enabled = true
+#    - Scales router pods based on CPU
+#
+# 2. Backend Scaling (Manual):
+#    - Create new LLMCluster resources
+#    - Update router.backends to include new instances
+#    - Router reloads config (zero downtime)
+#
+# 3. Do NOT use spec.autoscaling (DEPRECATED):
+#    - HPA for StatefulSets with TP is broken
+#    - Marked as deprecated in this CRD
+#
+# Example: Adding Capacity
+# ------------------------
+# # 1. Create Instance C
+# kubectl apply -f - <<EOF
+# apiVersion: serving.ai/v1alpha1
+# kind: LLMCluster
+# metadata:
+#   name: llama-3-70b-instance-c
+#   labels:
+#     app: llama-3-70b
+#     instance: c
+# spec:
+#   model: meta-llama/Meta-Llama-3-70B
+#   replicas: 2
+#   gpusPerPod: 4
+#   tensorParallelSize: 8
+# EOF
+#
+# # 2. Update router config (operator handles this)
+# kubectl patch llmc llama-3-70b-router --type=merge -p '
+# {
+#   "spec": {
+#     "router": {
+#       "backends": [
+#         {"name": "instance-a", "service": "llama-3-70b-instance-a"},
+#         {"name": "instance-b", "service": "llama-3-70b-instance-b"},
+#         {"name": "instance-c", "service": "llama-3-70b-instance-c"}
+#       ]
+#     }
+#   }
+# }'
+#
+# # 3. Router reloads, new instance is in rotation!

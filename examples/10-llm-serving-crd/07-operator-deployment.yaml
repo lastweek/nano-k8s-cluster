@@ -1,0 +1,338 @@
+# LLMCluster Autoscaler Operator Deployment
+#
+# This deploys the operator that watches LLMClusterAutoscaler resources
+# and manages LLMCluster instances automatically.
+
+---
+# ============================================
+# RBAC: ServiceAccount
+# ============================================
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: llmcluster-autoscaler
+  namespace: default
+
+---
+# ============================================
+# RBAC: ClusterRole
+# ============================================
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: llmcluster-autoscaler
+rules:
+# CRD permissions
+- apiGroups:
+  - serving.ai
+  resources:
+  - llmclusters
+  - llmclusters/status
+  - llmclusterautoscalers
+  - llmclusterautoscalers/status
+  verbs:
+  - get
+  - list
+  - watch
+  - create
+  - update
+  - patch
+  - delete
+
+# Standard K8s resources
+- apiGroups:
+  - ""
+  resources:
+  - configmaps
+  - secrets
+  verbs:
+  - get
+  - list
+  - watch
+  - create
+  - update
+  - patch
+
+# Events
+- apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+
+---
+# ============================================
+# RBAC: ClusterRoleBinding
+# ============================================
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: llmcluster-autoscaler
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: llmcluster-autoscaler
+subjects:
+- kind: ServiceAccount
+  name: llmcluster-autoscaler
+  namespace: default
+
+---
+# ============================================
+# OPERATOR Deployment
+# ============================================
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llmcluster-autoscaler
+  namespace: default
+  labels:
+    app: llmcluster-autoscaler
+spec:
+  replicas: 2
+  revisionHistoryLimit: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: llmcluster-autoscaler
+  template:
+    metadata:
+      labels:
+        app: llmcluster-autoscaler
+    spec:
+      serviceAccountName: llmcluster-autoscaler
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  app: llmcluster-autoscaler
+      containers:
+      - name: operator
+        # Replace with your pushed image tag from Dockerfile.autoscaler build.
+        image: ghcr.io/example/llmcluster-autoscaler:v0.1.0
+        imagePullPolicy: IfNotPresent
+        args:
+        - --leader-elect=true
+        - --sync-interval=30s
+        - --metrics-bind-address=:8080
+        - --health-probe-bind-address=:8081
+        - --zap-log-level=info
+        env:
+        - name: WATCH_NAMESPACE
+          value: ""
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: OPERATOR_NAME
+          value: "llmcluster-autoscaler"
+        ports:
+        - name: metrics
+          containerPort: 8080
+        - name: healthz
+          containerPort: 8081
+        resources:
+          requests:
+            cpu: "200m"
+            memory: "256Mi"
+          limits:
+            cpu: "1000m"
+            memory: "1Gi"
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          runAsUser: 65532
+          runAsGroup: 65532
+          capabilities:
+            drop: ["ALL"]
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8081
+          initialDelaySeconds: 15
+          periodSeconds: 20
+          timeoutSeconds: 5
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8081
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 5
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+      volumes:
+      - name: tmp
+        emptyDir: {}
+
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: llmcluster-autoscaler
+  namespace: default
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: llmcluster-autoscaler
+
+---
+# ============================================
+# OPERATOR Service (for metrics)
+# ============================================
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: llmcluster-autoscaler-metrics
+  namespace: default
+  labels:
+    app: llmcluster-autoscaler
+spec:
+  ports:
+  - name: metrics
+    port: 8080
+    targetPort: metrics
+  - name: healthz
+    port: 8081
+    targetPort: healthz
+  selector:
+    app: llmcluster-autoscaler
+
+---
+# ============================================
+# Deployment Guide
+# ============================================
+#
+# 1. Build the autoscaler operator image from operator-autoscaler.go:
+#    docker build -f Dockerfile.autoscaler -t ghcr.io/<org>/llmcluster-autoscaler:v0.1.0 .
+#    docker push ghcr.io/<org>/llmcluster-autoscaler:v0.1.0
+#
+# 2. Deploy the operator:
+#    kubectl apply -f 00-llmcluster-crd.yaml          # Deploy LLMCluster CRD
+#    kubectl apply -f 00-llmclusterautoscaler-crd.yaml      # Deploy LLMClusterAutoscaler CRD
+#    kubectl apply -f 07-operator-deployment.yaml     # Deploy operator
+#
+# 3. Create an autoscaler instance:
+#    kubectl apply -f - <<EOF
+#    apiVersion: serving.ai/v1alpha1
+#    kind: LLMClusterAutoscaler
+#    metadata:
+#      name: llama-3-70b-autoscaler
+#    spec:
+#      prometheus:
+#        address: http://prometheus:9090
+#      scaleTargetRef:
+#        appLabel: "llama-3-70b"
+#        labelSelector: "app=llama-3-70b,serving.ai/role=instance"
+#      minInstances: 2
+#      maxInstances: 10
+#      metrics:
+#      - type: QueueLength
+#        query: sum(redis_queue_length{queue="request_queue",app="llama-3-70b"})
+#        threshold:
+#          scaleUp: 100
+#          scaleDown: 20
+#      instanceTemplate:
+#        namePrefix: llama-3-70b-instance-
+#        labels:
+#          app: llama-3-70b
+#          serving.ai/role: instance
+#        spec:
+#          model: meta-llama/Meta-Llama-3-70B
+#          replicas: 2
+#          gpusPerPod: 4
+#          tensorParallelSize: 8
+#      routerRef:
+#        name: llama-3-70b-router
+#        backendPort: 8000
+#      behavior:
+#        scaleUpStabilizationSeconds: 120
+#        scaleDownStabilizationSeconds: 600
+#    EOF
+#
+# 4. Check operator logs:
+#    kubectl logs -f deployment/llmcluster-autoscaler
+#
+# 5. Watch autoscaling events:
+#    kubectl get events --field-selector involvedObject.kind=LLMClusterAutoscaler -w
+#
+# 6. Generate load to trigger scaling:
+#    for i in {1..1000}; do
+#      curl http://llama-3-70b-router:8000/v1/completions &
+#    done
+#
+# 7. Watch new instances being created:
+#    kubectl get llmc -w
+#
+# ============================================
+# Architecture Diagram
+# ============================================
+#
+# ┌─────────────────────────────────────────────────────────────────┐
+# │  LLMCluster Autoscaling System                                  │
+# │  ┌───────────────────────────────────────────────────────────┐  │
+# │  │                                                           │  │
+# │  │  User creates LLMClusterAutoscaler CR                     │  │
+# │  │       ↓                                                   │  │
+# │  │  ┌─────────────────────────────────────────────────────┐ │  │
+# │  │  │ LLMClusterAutoscaler Operator (Pod)                  │ │  │
+# │  │  │                                                     │ │  │
+# │  │  │ Reconcile Loop:                                     │ │  │
+# │  │  │ 1. Watch LLMClusterAutoscaler CR                    │ │  │
+# │  │  │ 2. Collect metrics (Prometheus, Redis, DCGM)        │ │  │
+# │  │  │ 3. Evaluate thresholds                              │ │  │
+# │  │  │ 4. If scale-up:                                     │ │  │
+# │  │  │    - Create new LLMCluster CR                       │ │  │
+# │  │  │    - Wait for Ready                                 │ │  │
+# │  │  │    - Update router backends                         │ │  │
+# │  │  │ 5. If scale-down:                                   │ │  │
+# │  │  │    - Update router backends (remove)                │ │  │
+# │  │  │    - Wait for drain                                 │ │  │
+# │  │  │    - Delete LLMCluster CR                           │ │  │
+# │  │  └─────────────────────────────────────────────────────┘ │  │
+# │  │       ↓                                                   │  │
+# │  │  ┌─────────────────────────────────────────────────────┐ │  │
+# │  │  │ LLMCluster Instances (CRs)                          │ │  │
+# │  │  │ ┌─────────────────────────────────────────────────┐ │ │  │
+# │  │  │ │ Instance A (llama-3-70b-instance-a)              │ │ │  │
+# │  │  │ │ StatefulSet: 2 pods, TP=8                       │ │ │  │
+# │  │  │ └─────────────────────────────────────────────────┘ │ │  │
+# │  │  │ ┌─────────────────────────────────────────────────┐ │ │  │
+# │  │  │ │ Instance B (llama-3-70b-instance-b)              │ │ │  │
+# │  │  │ │ StatefulSet: 2 pods, TP=8                       │ │ │  │
+# │  │  │ └─────────────────────────────────────────────────┘ │ │  │
+# │  │  │ ┌─────────────────────────────────────────────────┐ │ │  │
+# │  │  │ │ Instance C (created by operator!)               │ │ │  │
+# │  │  │ │ StatefulSet: 2 pods, TP=8                       │ │ │  │
+# │  │  │ └─────────────────────────────────────────────────┘ │ │  │
+# │  │  └─────────────────────────────────────────────────────┘ │  │
+# │  │                                                           │  │
+# │  └───────────────────────────────────────────────────────────┘  │
+# └─────────────────────────────────────────────────────────────────┘

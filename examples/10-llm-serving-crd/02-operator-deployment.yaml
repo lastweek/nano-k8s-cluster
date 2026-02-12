@@ -1,0 +1,283 @@
+# LLMCluster Operator Deployment
+#
+# This deployment runs the controller that reconciles LLMCluster resources.
+# The controller watches for LLMCluster resources and creates/updates all
+# necessary K8s resources (StatefulSets, Services, ConfigMaps, etc.)
+#
+# The operator is built using Kubebuilder/controller-runtime patterns.
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llmcluster-operator
+  namespace: default
+  labels:
+    app: llmcluster-operator
+    controller: llmcluster
+spec:
+  replicas: 1  # Single replica for now (can add HA with leader election)
+  selector:
+    matchLabels:
+      app: llmcluster-operator
+      controller: llmcluster
+  template:
+    metadata:
+      labels:
+        app: llmcluster-operator
+        controller: llmcluster
+    spec:
+      serviceAccountName: llmcluster-operator
+
+      # Don't run on control-plane nodes
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - llmcluster-operator
+              topologyKey: kubernetes.io/hostname
+
+        # Avoid scheduling on GPU nodes (operator doesn't need GPUs)
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: gpu.node
+                operator: DoesNotExist
+
+      # Init container to verify CRD is installed
+      initContainers:
+      - name: check-crd
+        image: bitnami/kubectl:latest
+        command:
+        - sh
+        - -c
+        - |
+          echo "Checking if LLMCluster CRD is installed..."
+          until kubectl get crd llmclusters.serving.ai 2>/dev/null; do
+            echo "Waiting for LLMCluster CRD..."
+            sleep 5
+          done
+          echo "CRD found! Starting operator..."
+
+      containers:
+      - name: manager
+        # Replace with your actual operator image
+        image: llmcluster-operator:latest
+        imagePullPolicy: IfNotPresent
+
+        # ================================
+        # Controller Flags
+        # ================================
+        command:
+        - /manager
+        args:
+        # Leader election for HA
+        - --leader-elect
+        - --leader-election-id=llmcluster-operator
+
+        # Metrics endpoint
+        - --metrics-bind-address=:8080
+
+        # Health probes
+        - --health-probe-bind-address=:8081
+
+        # Watch namespace (empty = all namespaces)
+        # - --watch-namespace=default
+
+        # ====================================
+        # Environment Variables
+        # ====================================
+        env:
+        # Kubernetes service account for leader election
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+
+        # Development mode (verbose logging, hot reload)
+        - name: DEVELOPMENT
+          value: "false"
+
+        # ====================================
+        # Ports
+        # ====================================
+        ports:
+        # Metrics endpoint (Prometheus)
+        - name: metrics
+          containerPort: 8080
+          protocol: TCP
+
+        # Health probe endpoint
+        - name: healthz
+          containerPort: 8081
+          protocol: TCP
+
+        # ====================================
+        # Probes
+        # ====================================
+        startupProbe:
+          httpGet:
+            path: /healthz
+            port: 8081
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          failureThreshold: 30
+
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8081
+          initialDelaySeconds: 15
+          periodSeconds: 20
+
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8081
+          initialDelaySeconds: 5
+          periodSeconds: 10
+
+        # ====================================
+        # Resource Limits
+        # ====================================
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+
+        # ====================================
+        # Security Context
+        # ====================================
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 65532
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+          readOnlyRootFilesystem: true
+
+        # Volume for leader election
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+
+      volumes:
+      - name: tmp
+        emptyDir: {}
+
+      # Restart policy for the operator
+      restartPolicy: Always
+
+---
+# Service for metrics scraping
+apiVersion: v1
+kind: Service
+metadata:
+  name: llmcluster-operator-metrics
+  namespace: default
+  labels:
+    app: llmcluster-operator
+spec:
+  selector:
+    app: llmcluster-operator
+  ports:
+  - name: metrics
+    port: 8080
+    targetPort: metrics
+  # ClusterIP is fine for metrics (Prometheus will scrape from within cluster)
+
+---
+# ServiceMonitor for Prometheus Operator (optional)
+# If you have Prometheus Operator installed, this enables metrics scraping
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: llmcluster-operator
+  namespace: default
+  labels:
+    app: llmcluster-operator
+spec:
+  selector:
+    matchLabels:
+      app: llmcluster-operator
+  endpoints:
+  - port: metrics
+    interval: 30s
+    path: /metrics
+
+---
+# Operator Deployment Architecture:
+#
+# ┌─────────────────────────────────────────────────────────────────┐
+# │  LLMCluster Operator Deployment                                  │
+# │  ┌───────────────────────────────────────────────────────────┐ │
+# │  │  Container: /manager                                       │ │
+# │  │  ┌─────────────────────────────────────────────────────┐ │ │
+# │  │  │  Controller Runtime                                   │ │ │
+# │  │  │  - Leader Election (lease on configmap)             │ │ │
+# │  │  │  - Watcher (LLMCluster resources)                    │ │ │
+# │  │  │  - Reconciler (creates child resources)              │ │ │
+# │  │  │  - Status Updater                                    │ │ │
+# │  │  │  - Event Recorder                                    │ │ │
+# │  │  └─────────────────────────────────────────────────────┘ │ │
+# │  │  ┌─────────────────────────────────────────────────────┐ │ │
+# │  │  │  Reconcile Loop:                                     │ │ │
+# │  │  │  1. Fetch LLMCluster                                │ │ │
+# │  │  │  2. Validate spec                                   │ │ │
+# │  │  │  3. Create/update StatefulSet (model pods)          │ │ │
+# │  │  │  4. Create/update Deployment (router)               │ │ │
+# │  │  │  5. Create/update Deployment (queue)                │ │ │
+# │  │  │  6. Create/update Services                          │ │ │
+# │  │  │  7. Create/update ConfigMaps                        │ │ │
+# │  │  │  8. Create/update HPA (if autoscaling enabled)      │ │ │
+# │  │  │  9. Create/update PDB (if HA enabled)               │ │ │
+# │  │  │  10. Update LLMCluster.status                       │ │ │
+# │  │  │  11. Requeue for next reconciliation                │ │ │
+# │  │  └─────────────────────────────────────────────────────┘ │ │
+# │  │                                                           │ │
+# │  │  Metrics: :8080/metrics                                  │ │
+# │  │  Health:  :8081/healthz                                  │ │
+# │  │  Ready:   :8081/readyz                                   │ │
+# │  └───────────────────────────────────────────────────────────┘ │
+# │                                                                 │
+# │  RBAC: llmcluster-operator ServiceAccount                      │
+# │  - Role (namespace): create StatefulSets, Services, etc.       │
+# │  - ClusterRole: read nodes, PVs                                │
+# └─────────────────────────────────────────────────────────────────┘
+
+# Deployment Instructions:
+#
+# 1. Build the operator image:
+#    make docker-build IMG=llmcluster-operator:latest
+#
+# 2. Load image into your cluster:
+#    kind load docker-image llmcluster-operator:latest  # for kind
+#    minikube image load llmcluster-operator:latest     # for minikube
+#
+# 3. Deploy the operator:
+#    kubectl apply -f 00-llmcluster-crd.yaml
+#    kubectl apply -f 01-rbac.yaml
+#    kubectl apply -f 02-operator-deployment.yaml
+#
+# 4. Verify operator is running:
+#    kubectl get pods -l app=llmcluster-operator
+#    kubectl logs -f deployment/llmcluster-operator
+#
+# 5. Create your first LLMCluster:
+#    kubectl apply -f 03-example-simple-llmcluster.yaml

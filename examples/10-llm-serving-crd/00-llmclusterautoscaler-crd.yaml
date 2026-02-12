@@ -1,0 +1,453 @@
+# LLMClusterAutoscaler CRD Definition
+#
+# This CRD supports BOTH:
+# 1. Monolithic LLM serving (single cluster type)
+# 2. Disaggregated Prefill/Decode serving (separate prefill and decode clusters)
+#
+# MODE SELECTION:
+# - Monolithic: Use scaleTargetRef + metrics + instanceTemplate
+# - Disaggregated: Use prefillPolicy + decodePolicy + prefillTemplate + decodeTemplate
+
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: llmclusterautoscalers.serving.ai
+spec:
+  group: serving.ai
+  names:
+    plural: llmclusterautoscalers
+    singular: llmclusterautoscaler
+    kind: LLMClusterAutoscaler
+    shortNames:
+    - llmca
+  scope: Namespaced
+  versions:
+  - name: v1alpha1
+    served: true
+    storage: true
+    subresources:
+      status: {}
+    additionalPrinterColumns:
+    - name: Mode
+      type: string
+      jsonPath: .spec.mode
+    - name: Min
+      type: integer
+      jsonPath: .spec.minInstances
+    - name: Max
+      type: integer
+      jsonPath: .spec.maxInstances
+    - name: Prefill-Min
+      type: integer
+      jsonPath: .spec.prefillPolicy.minInstances
+    - name: Prefill-Max
+      type: integer
+      jsonPath: .spec.prefillPolicy.maxInstances
+    - name: Decode-Min
+      type: integer
+      jsonPath: .spec.decodePolicy.minInstances
+    - name: Decode-Max
+      type: integer
+      jsonPath: .spec.decodePolicy.maxInstances
+    - name: Age
+      type: date
+      jsonPath: .metadata.creationTimestamp
+    schema:
+      openAPIV3Schema:
+        type: object
+        properties:
+          spec:
+            type: object
+            properties:
+              # ============================================
+              # MODE SELECTION
+              # ============================================
+              mode:
+                type: string
+                enum: ["monolithic", "disaggregated"]
+                default: "monolithic"
+                description: |
+                  "monolithic": Single LLMCluster type (traditional serving)
+                  "disaggregated": Separate prefill and decode clusters
+
+              prometheus:
+                type: object
+                required: ["address"]
+                properties:
+                  address:
+                    type: string
+                    description: "Prometheus base URL"
+                    example: "http://prometheus:9090"
+
+              # ============================================
+              # MONOLITHIC MODE (traditional serving)
+              # ============================================
+              # Used when mode == "monolithic" or for backward compatibility
+
+              scaleTargetRef:
+                type: object
+                description: "Target LLMClusters to scale (monolithic mode)"
+                properties:
+                  appLabel:
+                    type: string
+                    description: "App label to identify LLMCluster instances"
+                    example: "llama-3-70b"
+                  labelSelector:
+                    type: string
+                    description: "Kubernetes label selector for managed instances"
+                    example: "app=llama-3-70b,serving.ai/role=instance"
+
+              minInstances:
+                type: integer
+                minimum: 1
+                default: 2
+                description: "Minimum number of LLMCluster instances (monolithic mode)"
+
+              maxInstances:
+                type: integer
+                minimum: 1
+                default: 10
+                description: "Maximum number of LLMCluster instances (monolithic mode)"
+
+              metrics:
+                type: array
+                description: "Metrics for scaling (monolithic mode)"
+                items:
+                  type: object
+                  required: ["type"]
+                  properties:
+                    type:
+                      type: string
+                      enum: ["QueueLength", "TTFT", "TPOT", "Latency", "GPUUtilization"]
+                      description: "Metric type"
+                    query:
+                      type: string
+                      description: "PromQL query returning a single scalar value"
+                    threshold:
+                      type: object
+                      properties:
+                        scaleUp:
+                          type: number
+                          description: "Create new instance when metric exceeds this value"
+                        scaleDown:
+                          type: number
+                          description: "Remove instance when metric falls below this value"
+
+              instanceTemplate:
+                type: object
+                description: "Template for new LLMCluster instances (monolithic mode)"
+                properties:
+                  namePrefix:
+                    type: string
+                    description: "Prefix used for generated instance names"
+                    example: "llama-3-70b-instance-"
+                  labels:
+                    type: object
+                    additionalProperties:
+                      type: string
+                  annotations:
+                    type: object
+                    additionalProperties:
+                      type: string
+                  spec:
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
+                    description: "Full LLMCluster spec for new instances"
+
+              # ============================================
+              # DISAGGREGATED MODE (prefill/decode)
+              # ============================================
+              # Used when mode == "disaggregated"
+
+              prefillPolicy:
+                type: object
+                description: "Prefill cluster scaling policy (disaggregated mode)"
+                properties:
+                  minInstances:
+                    type: integer
+                    minimum: 1
+                    default: 2
+                    description: "Minimum number of prefill clusters"
+
+                  maxInstances:
+                    type: integer
+                    minimum: 1
+                    default: 6
+                    description: "Maximum number of prefill clusters"
+
+                  scaleTargetRef:
+                    type: object
+                    required: ["labelSelector"]
+                    properties:
+                      appLabel:
+                        type: string
+                        example: "llama-3-70b"
+                      labelSelector:
+                        type: string
+                        description: "Label selector for prefill clusters"
+                        example: "app=llama-3-70b,role=prefill"
+
+                  metrics:
+                    type: array
+                    items:
+                      type: object
+                      required: ["type"]
+                      properties:
+                        type:
+                          type: string
+                          enum: ["PrefillQueueDepth", "PrefillLatency", "TTFT"]
+                        query:
+                          type: string
+                        threshold:
+                          type: object
+                          properties:
+                            scaleUp:
+                              type: number
+                            scaleDown:
+                              type: number
+
+                  behavior:
+                    type: object
+                    properties:
+                      scaleUpStabilizationSeconds:
+                        type: integer
+                        default: 120
+                        description: "Wait time before scaling up prefill clusters"
+                      scaleDownStabilizationSeconds:
+                        type: integer
+                        default: 600
+                        description: "Wait time before scaling down prefill clusters"
+
+              decodePolicy:
+                type: object
+                description: "Decode cluster scaling policy (disaggregated mode)"
+                properties:
+                  minInstances:
+                    type: integer
+                    minimum: 1
+                    default: 4
+                    description: "Minimum number of decode clusters"
+
+                  maxInstances:
+                    type: integer
+                    minimum: 1
+                    default: 12
+                    description: "Maximum number of decode clusters"
+
+                  scaleTargetRef:
+                    type: object
+                    required: ["labelSelector"]
+                    properties:
+                      appLabel:
+                        type: string
+                        example: "llama-3-70b"
+                      labelSelector:
+                        type: string
+                        description: "Label selector for decode clusters"
+                        example: "app=llama-3-70b,role=decode"
+
+                  metrics:
+                    type: array
+                    items:
+                      type: object
+                      required: ["type"]
+                      properties:
+                        type:
+                          type: string
+                          enum: ["DecodeLatency", "TokensPerSecond", "TPOT"]
+                        query:
+                          type: string
+                        threshold:
+                          type: object
+                          properties:
+                            scaleUp:
+                              type: number
+                            scaleDown:
+                              type: number
+
+                  behavior:
+                    type: object
+                    properties:
+                      scaleUpStabilizationSeconds:
+                        type: integer
+                        default: 60
+                        description: "Wait time before scaling up decode clusters (faster)"
+                      scaleDownStabilizationSeconds:
+                        type: integer
+                        default: 300
+                        description: "Wait time before scaling down decode clusters"
+
+              # Instance templates for disaggregated mode
+              prefillTemplate:
+                type: object
+                description: "Template for new prefill LLMCluster instances"
+                properties:
+                  namePrefix:
+                    type: string
+                    example: "llama-3-70b-prefill-"
+                  labels:
+                    type: object
+                    additionalProperties:
+                      type: string
+                    example:
+                      role: prefill
+                      app: llama-3-70b
+                  spec:
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
+
+              decodeTemplate:
+                type: object
+                description: "Template for new decode LLMCluster instances"
+                properties:
+                  namePrefix:
+                    type: string
+                    example: "llama-3-70b-decode-"
+                  labels:
+                    type: object
+                    additionalProperties:
+                      type: string
+                    example:
+                      role: decode
+                      app: llama-3-70b
+                  spec:
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
+
+              # ============================================
+              # ROUTER CONFIGURATION (shared between modes)
+              # ============================================
+
+              routerRef:
+                type: object
+                description: "Router configuration for backend updates"
+                properties:
+                  name:
+                    type: string
+                    description: "Name of the router LLMCluster"
+                    example: "llama-3-70b-router"
+                  backendPort:
+                    type: integer
+                    default: 8000
+                    description: "Backend service port"
+                  backendNamePrefix:
+                    type: string
+                    description: "Prefix trimmed from service names for backend display name"
+                    example: "llama-3-70b-instance-"
+
+                  # Disaggregated mode: router coordination settings
+                  maxPrefillPerDecode:
+                    type: integer
+                    default: 2
+                    description: "Max concurrent prefill requests per decode cluster (disaggregated mode)"
+
+                  decodeQueueing:
+                    type: object
+                    properties:
+                      enabled:
+                        type: boolean
+                        default: true
+                      maxQueueSize:
+                        type: integer
+                        default: 100
+
+              # ============================================
+              # SHARED BEHAVIOR
+              # ============================================
+
+              behavior:
+                type: object
+                description: "Global scaling behavior (monolithic mode)"
+                properties:
+                  scaleUpStabilizationSeconds:
+                    type: integer
+                    default: 60
+                    description: "Wait time before scaling up again"
+
+                  scaleDownStabilizationSeconds:
+                    type: integer
+                    default: 300
+                    description: "Wait time before scaling down"
+
+                  startupTimeoutSeconds:
+                    type: integer
+                    default: 600
+                    description: "Max time to wait for new instance to be ready"
+
+          # ============================================
+          # STATUS
+          # ============================================
+          status:
+            type: object
+            properties:
+              # Current state
+              currentInstances:
+                type: integer
+                description: "Current number of instances (monolithic mode)"
+              desiredInstances:
+                type: integer
+                description: "Desired number of instances (monolithic mode)"
+
+              currentPrefillInstances:
+                type: integer
+                description: "Current number of prefill instances (disaggregated mode)"
+              desiredPrefillInstances:
+                type: integer
+                description: "Desired number of prefill instances (disaggregated mode)"
+
+              currentDecodeInstances:
+                type: integer
+                description: "Current number of decode instances (disaggregated mode)"
+              desiredDecodeInstances:
+                type: integer
+                description: "Desired number of decode instances (disaggregated mode)"
+
+              # Last action
+              lastScaleTime:
+                type: string
+                format: date-time
+                description: "Timestamp of last scale action"
+
+              lastScaleAction:
+                type: string
+                enum: ["ScaleUp", "ScaleDown", "NoOp", "Blocked"]
+                description: "Last action taken"
+
+              lastPrefillScaleAction:
+                type: string
+                enum: ["ScaleUp", "ScaleDown", "NoOp", "Blocked"]
+                description: "Last prefill scale action (disaggregated mode)"
+
+              lastDecodeScaleAction:
+                type: string
+                enum: ["ScaleUp", "ScaleDown", "NoOp", "Blocked"]
+                description: "Last decode scale action (disaggregated mode)"
+
+              # Observed metrics
+              observedMetrics:
+                type: object
+                additionalProperties:
+                  type: number
+                description: "Latest observed metric values"
+
+              # Conditions
+              conditions:
+                type: array
+                items:
+                  type: object
+                  required: ["type", "status"]
+                  properties:
+                    type:
+                      type: string
+                      enum: ["Ready", "MetricsAvailable", "ScalingActive", "Degraded"]
+                    status:
+                      type: string
+                      enum: ["True", "False", "Unknown"]
+                    reason:
+                      type: string
+                    message:
+                      type: string
+                    lastTransitionTime:
+                      type: string
+                      format: date-time

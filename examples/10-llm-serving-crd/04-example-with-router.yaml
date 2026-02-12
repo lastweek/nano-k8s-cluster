@@ -1,0 +1,189 @@
+# Example 02: Multi-Instance LLMCluster with Router
+#
+# This example shows the CORRECT way to deploy multiple model instances
+# with a router for load balancing.
+#
+# KEY ARCHITECTURE:
+# - Each LLMCluster = ONE model instance (with its own TP)
+# - Router balances ACROSS LLMCluster instances
+# - To scale: Create new LLMClusters (NOT increase replicas)
+
+---
+# ============================================
+# INSTANCE A
+# ============================================
+
+apiVersion: serving.ai/v1alpha1
+kind: LLMCluster
+metadata:
+  name: llama-3-70b-instance-a
+  namespace: default
+  labels:
+    app: llama-3-70b
+    instance: a
+    serving.ai/role: instance
+spec:
+  model: meta-llama/Meta-Llama-3-70B
+  modelSize: 70B
+
+  # Fixed TP configuration for this instance
+  replicas: 2       # 2 pods for TP
+  gpusPerPod: 4     # 4 GPUs per pod
+  tensorParallelSize: 8  # TP = 2 × 4 = 8
+
+  image: vllm/vllm-openai:latest
+  inferenceEngine: vllm
+
+  # No router per instance - router is shared
+  router:
+    enabled: false
+  queue:
+    enabled: false
+
+  scheduling:
+    nodeSelector:
+      gpu.node: "true"
+    podAntiAffinity: Required
+
+---
+# ============================================
+# INSTANCE B
+# ============================================
+
+apiVersion: serving.ai/v1alpha1
+kind: LLMCluster
+metadata:
+  name: llama-3-70b-instance-b
+  namespace: default
+  labels:
+    app: llama-3-70b
+    instance: b
+    serving.ai/role: instance
+spec:
+  model: meta-llama/Meta-Llama-3-70B
+  modelSize: 70B
+
+  # Same TP configuration
+  replicas: 2       # 2 pods for TP
+  gpusPerPod: 4     # 4 GPUs per pod
+  tensorParallelSize: 8  # TP = 2 × 4 = 8
+
+  image: vllm/vllm-openai:latest
+  inferenceEngine: vllm
+
+  # No router per instance - router is shared
+  router:
+    enabled: false
+  queue:
+    enabled: false
+
+  scheduling:
+    nodeSelector:
+      gpu.node: "true"
+    podAntiAffinity: Required
+
+---
+# ============================================
+# SHARED ROUTER
+# ============================================
+# The router balances ACROSS LLMCluster instances
+
+apiVersion: serving.ai/v1alpha1
+kind: LLMCluster
+metadata:
+  name: llama-3-70b-router
+  namespace: default
+spec:
+  # Router-only cluster (no model pods)
+  model: none  # Special value for router-only
+
+  # Create router deployment
+  router:
+    enabled: true
+    replicas: 2           # 2 router pods for HA
+    type: nginx
+    # Backend instances to balance across
+    backends:
+    - name: instance-a
+      service: llama-3-70b-instance-a
+      port: 8000
+    - name: instance-b
+      service: llama-3-70b-instance-b
+      port: 8000
+
+  # Queue for request buffering
+  queue:
+    enabled: true
+    replicas: 2
+    backend: redis
+    capacity: 1000
+
+  network:
+    serviceType: ClusterIP
+    port: 8000
+
+# ============================================
+# What gets created:
+# ============================================
+# Instance A:
+#   1. StatefulSet: llama-3-70b-instance-a (2 pods, TP=8)
+#   2. Service: llama-3-70b-instance-a (external access)
+#
+# Instance B:
+#   1. StatefulSet: llama-3-70b-instance-b (2 pods, TP=8)
+#   2. Service: llama-3-70b-instance-b (external access)
+#
+# Router:
+#   1. Deployment: llama-3-70b-router (2 pods, nginx)
+#   2. Deployment: llama-3-70b-router-queue (2 pods, redis)
+#   3. Service: llama-3-70b-router (main entry point)
+#   4. ConfigMap: router-config (nginx config with both backends)
+#
+# Architecture:
+#
+#   Client Request
+#       ↓
+#   Service: llama-3-70b-router:8000
+#       ↓
+#   Router Pods (2 replicas, nginx)
+#       ↓ (load balancing ACROSS INSTANCES)
+#   ┌─────────────────────┐  ┌─────────────────────────────┐
+#   │ Instance A           │  │ Instance B                 │
+#   │ StatefulSet (2 pods) │  │ StatefulSet (2 pods)       │
+#   │ Pod-0 (rank 0)       │  │ Pod-0 (rank 0)             │
+#   │ Pod-1 (rank 1)       │  │ Pod-1 (rank 1)             │
+#   │ TP=8 (2×4 GPUs)      │  │ TP=8 (2×4 GPUs)            │
+#   └─────────────────────┘  └─────────────────────────────┘
+#       ↓                              ↓
+#   Response (aggregated from instances)
+#
+# ============================================
+# Access:
+# ============================================
+#   kubectl port-forward svc/llama-3-70b-router 8000:8000
+#   curl http://localhost:8000/v1/completions \
+#     -H "Content-Type: application/json" \
+#     -d '{"model":"meta-llama/Meta-Llama-3-70B","prompt":"Hello","max_tokens":10}'
+#
+# ============================================
+# Scaling:
+# ============================================
+# To add capacity, create Instance C:
+#
+# apiVersion: serving.ai/v1alpha1
+# kind: LLMCluster
+# metadata:
+#   name: llama-3-70b-instance-c
+#   labels:
+#     app: llama-3-70b
+#     instance: c
+# spec:
+#   model: meta-llama/Meta-Llama-3-70B
+#   replicas: 2
+#   gpusPerPod: 4
+#   tensorParallelSize: 8
+#   router:
+#     enabled: false
+#
+# Then update router config to include instance-c backend.
+# DO NOT increase replicas on existing instances!

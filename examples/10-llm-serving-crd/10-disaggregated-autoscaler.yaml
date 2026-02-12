@@ -1,0 +1,313 @@
+# Disaggregated Prefill/Decode LLMClusterAutoscaler
+#
+# This example shows how to use LLMClusterAutoscaler with mode=disaggregated
+# to independently scale prefill and decode clusters.
+#
+# Note: the CRD supports this policy shape. The current autoscaler controller
+# implementation is primarily monolithic-focused; treat this file as the target
+# API contract for full PD-disaggregated autoscaling behavior.
+#
+# Architecture:
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │  LLMClusterAutoscaler (mode=disaggregated)                               │
+# │  ┌─────────────────────────────────────────────────────────────────────┐  │
+# │  │ Prefill Policy                                                     │  │
+# │  │  - Target: role=prefill                                           │  │
+# │  │  - Metrics: PrefillQueueDepth, PrefillLatency                     │  │
+# │  │  - Scale: 2-6 instances                                           │  │
+# │  └─────────────────────────────────────────────────────────────────────┘  │
+# │  ┌─────────────────────────────────────────────────────────────────────┐  │
+# │  │ Decode Policy                                                      │  │
+# │  │  - Target: role=decode                                             │  │
+# │  │  - Metrics: DecodeLatency, TokensPerSecond                       │  │
+# │  │  - Scale: 4-12 instances                                          │  │
+# │  └─────────────────────────────────────────────────────────────────────┘  │
+# │  ┌─────────────────────────────────────────────────────────────────────┐  │
+# │  │ Router Coordination                                                │  │
+# │  │  - Update router backends dynamically                              │  │
+# │  │  - Enforce maxPrefillPerDecode constraint                          │  │
+# │  └─────────────────────────────────────────────────────────────────────┘  │
+# └─────────────────────────────────────────────────────────────────────────┘
+#
+# Benefits of disaggregated autoscaling:
+# - Independent scaling: Prefill and decode scale based on different signals
+# - Phase-specific metrics: Pre-fill queue vs decode latency
+# - Faster decode scaling: Decode clusters (TP-4) scale faster than prefill (TP-8)
+# - Resource optimization: Match cluster size to phase requirements
+
+---
+apiVersion: serving.ai/v1alpha1
+kind: LLMClusterAutoscaler
+metadata:
+  name: llama-3-70b-disaggregated-autoscaler
+  namespace: default
+  labels:
+    app: llama-3-70b
+    autoscaler-mode: disaggregated
+spec:
+  mode: disaggregated  # CRITICAL: Enables disaggregated mode
+
+  prometheus:
+    address: http://prometheus:9090
+
+  # ============================================
+  # PREFILL SCALING POLICY
+  # ============================================
+  prefillPolicy:
+    minInstances: 2
+    maxInstances: 6
+
+    # Target prefill clusters by label
+    scaleTargetRef:
+      appLabel: "llama-3-70b"
+      labelSelector: "app=llama-3-70b,role=prefill"
+
+    # Prefill-specific metrics
+    metrics:
+    - type: PrefillQueueDepth
+      query: |
+        sum(redis_queue_length{queue="prefill_queue",app="llama-3-70b",role="prefill"})
+      threshold:
+        scaleUp: 50    # Scale up when prefill queue > 50
+        scaleDown: 10  # Scale down when prefill queue < 10
+
+    - type: PrefillLatency
+      query: |
+        histogram_quantile(0.95,
+          sum(rate(llm_prefill_latency_seconds{app="llama-3-70b",role="prefill"}[2m])) by (le)
+        ) * 1000
+      threshold:
+        scaleUp: 2000   # Scale up when p95 prefill latency > 2000ms
+        scaleDown: 800  # Scale down when p95 prefill latency < 800ms
+
+    # Prefill scales slower (larger TP-8 clusters take longer to start)
+    behavior:
+      scaleUpStabilizationSeconds: 120   # Wait 2 min before scaling up
+      scaleDownStabilizationSeconds: 600 # Wait 10 min before scaling down
+
+  # ============================================
+  # DECODE SCALING POLICY
+  # ============================================
+  decodePolicy:
+    minInstances: 4
+    maxInstances: 12
+
+    # Target decode clusters by label
+    scaleTargetRef:
+      appLabel: "llama-3-70b"
+      labelSelector: "app=llama-3-70b,role=decode"
+
+    # Decode-specific metrics
+    metrics:
+    - type: DecodeLatency
+      query: |
+        histogram_quantile(0.95,
+          sum(rate(llm_decode_latency_seconds{app="llama-3-70b",role="decode"}[2m])) by (le)
+        ) * 1000
+      threshold:
+        scaleUp: 150   # Scale up when p95 decode latency > 150ms
+        scaleDown: 60  # Scale down when p95 decode latency < 60ms
+
+    - type: TokensPerSecond
+      query: |
+        sum(rate(llm_tokens_generated_total{app="llama-3-70b",role="decode"}[1m]))
+      threshold:
+        scaleUp: 100   # Scale up when per-decode TPS drops below 100
+        scaleDown: 30  # Scale down when per-decode TPS is > 30
+
+    # Decode scales faster (smaller TP-4 clusters start quicker)
+    behavior:
+      scaleUpStabilizationSeconds: 60    # Wait 1 min before scaling up (faster)
+      scaleDownStabilizationSeconds: 300 # Wait 5 min before scaling down
+
+  # ============================================
+  # INSTANCE TEMPLATES
+  # ============================================
+
+  # Template for new prefill clusters (TP-8)
+  prefillTemplate:
+    namePrefix: llama-3-70b-prefill-
+    labels:
+      app: llama-3-70b
+      role: prefill
+      autoscaling.serving.ai/managed-by: llama-3-70b-disaggregated-autoscaler
+    spec:
+      model: meta-llama/Meta-Llama-3-70B
+      modelSize: 70B
+      replicas: 2
+      gpusPerPod: 4         # 2 pods × 4 GPUs = TP-8
+      tensorParallelSize: 8
+      image: vllm/vllm-openai:latest
+      inferenceEngine: vllm
+      inferenceArgs:
+        maxModelLen: 4096
+        blockSize: 16
+        dtype: half
+        gpuMemoryUtilization: 0.95
+        prefillOnly: true
+        kvCacheTransferMode: "side-channel"
+      resources:
+        requests:
+          cpu: "32"
+          memory: "128Gi"
+        limits:
+          memory: "256Gi"
+      router:
+        enabled: false
+      queue:
+        enabled: false
+      storage:
+        shmSize: 32Gi
+      scheduling:
+        nodeSelector:
+          gpu.node: "true"
+          gpu.type: "h100"
+        podAntiAffinity: Required
+      highAvailability:
+        podDisruptionBudget:
+          enabled: true
+          minAvailable: 1
+        terminationGracePeriodSeconds: 300
+
+  # Template for new decode clusters (TP-4)
+  decodeTemplate:
+    namePrefix: llama-3-70b-decode-
+    labels:
+      app: llama-3-70b
+      role: decode
+      autoscaling.serving.ai/managed-by: llama-3-70b-disaggregated-autoscaler
+    spec:
+      model: meta-llama/Meta-Llama-3-70B
+      modelSize: 70B
+      replicas: 2
+      gpusPerPod: 2         # 2 pods × 2 GPUs = TP-4
+      tensorParallelSize: 4
+      image: vllm/vllm-openai:latest
+      inferenceEngine: vllm
+      inferenceArgs:
+        maxModelLen: 4096
+        blockSize: 16
+        dtype: half
+        gpuMemoryUtilization: 0.9
+        decodeOnly: true
+        kvCacheTransferMode: "side-channel"
+        speculativeDecoding:
+          enabled: true
+          numSpeculativeTokens: 5
+          samplingStrategy: "beam"
+      resources:
+        requests:
+          cpu: "16"
+          memory: "64Gi"
+        limits:
+          memory: "128Gi"
+      router:
+        enabled: false
+      queue:
+        enabled: false
+      storage:
+        shmSize: 16Gi
+      scheduling:
+        nodeSelector:
+          gpu.node: "true"
+          gpu.memory: "high-bandwidth"
+        podAntiAffinity: Required
+      highAvailability:
+        podDisruptionBudget:
+          enabled: true
+          minAvailable: 1
+        terminationGracePeriodSeconds: 600
+
+  # ============================================
+  # ROUTER CONFIGURATION
+  # ============================================
+  routerRef:
+    name: llama-3-70b-prefill-decode-router
+    backendPort: 8000
+
+    # Coordination constraints
+    maxPrefillPerDecode: 2
+    decodeQueueing:
+      enabled: true
+      maxQueueSize: 100
+
+# ============================================
+# DEPLOYMENT INSTRUCTIONS
+# ============================================
+#
+# Prerequisites:
+# 1. Deploy base LLMCluster and LLMClusterAutoscaler CRDs:
+#    kubectl apply -f 00-llmcluster-crd.yaml
+#    kubectl apply -f 00-llmclusterautoscaler-crd.yaml
+#
+# 2. Deploy the serving operator (reconciles LLMCluster):
+#    kubectl apply -f 02-operator-deployment.yaml
+#
+# 3. Deploy the autoscaler operator (reconciles LLMClusterAutoscaler):
+#    kubectl apply -f 07-operator-deployment.yaml
+#
+# 4. Deploy Prometheus for metrics:
+#    kubectl apply -f https://raw.githubusercontent.com/prometheus-operator/prometheus-operator/main/bundle.yaml
+#
+# 5. Deploy initial prefill/decode clusters:
+#    kubectl apply -f 08-disaggregated-prefill-decode.yaml
+#
+# Deploy the autoscaler:
+#    kubectl apply -f 10-disaggregated-autoscaler.yaml
+#
+# Verify the autoscaler is running:
+#    kubectl get llmca llama-3-70b-disaggregated-autoscaler -o yaml
+#    kubectl describe llmca llama-3-70b-disaggregated-autoscaler
+#
+# Watch for scaling events:
+#    kubectl get events --field-selector involvedObject.kind=LLMClusterAutoscaler
+#
+# Check cluster counts:
+#    kubectl get llmc -l role=prefill
+#    kubectl get llmc -l role=decode
+#
+# Generate load to test scaling:
+#    # Send requests to router
+#    kubectl port-forward svc/llama-3-70b-prefill-decode-router 8000:8000
+#    curl http://localhost:8000/v1/completions \
+#      -H "Content-Type: application/json" \
+#      -d '{"model": "meta-llama/Meta-Llama-3-70B", "prompt": "Explain Kubernetes", "max_tokens": 100}'
+#
+# ============================================
+# EXPECTED BEHAVIOR
+# ============================================
+#
+# Initial State:
+# - 2 prefill clusters (TP-8)
+# - 4 decode clusters (TP-4)
+#
+# Under High Load:
+# - Prefill queue grows → autoscaler creates prefill-02, prefill-03, ...
+# - Decode latency increases → autoscaler creates decode-04, decode-05, ...
+#
+# Under Low Load:
+# - Prefill utilization drops → autoscaler removes prefill instances
+# - Decode TPS is high → autoscaler keeps decode instances
+#
+# Router Updates:
+# - Each time a cluster is created/deleted
+# - Autoscaler patches router.spec.router.prefillBackends
+# - Autoscaler patches router.spec.router.decodeBackends
+# - Router reloads configuration automatically
+
+# ============================================
+# MONOLITHIC VS DISAGGREGATED
+# ============================================
+#
+# Monolithic Autoscaler (mode=monolithic):
+# - Single instance type
+# - Scale based on: QueueLength, TTFT, TPOT
+# - Target: LLMCluster instances with role=instance
+# - Example: 06-example-with-crd-autoscaler.yaml
+#
+# Disaggregated Autoscaler (mode=disaggregated):
+# - Two instance types (prefill + decode)
+# - Prefill metrics: PrefillQueueDepth, PrefillLatency
+# - Decode metrics: DecodeLatency, TokensPerSecond
+# - Target: LLMCluster with role=prefill and role=decode
+# - Example: This file (10-disaggregated-autoscaler.yaml)

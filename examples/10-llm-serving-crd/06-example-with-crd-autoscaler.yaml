@@ -1,0 +1,91 @@
+# Monolithic Fleet Autoscaler Policy
+#
+# This file contains only the LLMClusterAutoscaler policy.
+# Install CRDs first from:
+# - 00-llmcluster-crd.yaml
+# - 00-llmclusterautoscaler-crd.yaml
+
+apiVersion: serving.ai/v1alpha1
+kind: LLMClusterAutoscaler
+metadata:
+  name: llama-3-70b-autoscaler
+  namespace: default
+  labels:
+    app: llama-3-70b
+    autoscaler-mode: monolithic
+spec:
+  mode: monolithic
+
+  prometheus:
+    address: http://prometheus:9090
+
+  # Select monolithic serving instances managed as one fleet.
+  scaleTargetRef:
+    appLabel: llama-3-70b
+    labelSelector: app=llama-3-70b,serving.ai/role=instance
+
+  minInstances: 2
+  maxInstances: 10
+
+  metrics:
+  - type: QueueLength
+    query: |
+      sum(redis_queue_length{queue="request_queue",app="llama-3-70b"})
+    threshold:
+      scaleUp: 100
+      scaleDown: 20
+
+  - type: TTFT
+    query: |
+      histogram_quantile(0.95,
+        sum(rate(llm_ttft_seconds_bucket{app="llama-3-70b"}[2m])) by (le)
+      ) * 1000
+    threshold:
+      scaleUp: 2500
+      scaleDown: 900
+
+  - type: TPOT
+    query: |
+      histogram_quantile(0.95,
+        sum(rate(llm_tpot_seconds_bucket{app="llama-3-70b"}[2m])) by (le)
+      ) * 1000
+    threshold:
+      scaleUp: 140
+      scaleDown: 80
+
+  instanceTemplate:
+    namePrefix: llama-3-70b-instance-
+    labels:
+      app: llama-3-70b
+      serving.ai/role: instance
+      autoscaling.serving.ai/managed-by: llama-3-70b-autoscaler
+    spec:
+      model: meta-llama/Meta-Llama-3-70B
+      modelSize: 70B
+      replicas: 2
+      gpusPerPod: 4
+      tensorParallelSize: 8
+      image: vllm/vllm-openai:latest
+      inferenceEngine: vllm
+      router:
+        enabled: false
+      queue:
+        enabled: false
+      scheduling:
+        nodeSelector:
+          gpu.node: "true"
+
+  # Shared router that receives backend updates as instances are added/removed.
+  routerRef:
+    name: llama-3-70b-router
+    backendPort: 8000
+    backendNamePrefix: llama-3-70b-instance-
+
+  behavior:
+    scaleUpStabilizationSeconds: 120
+    scaleDownStabilizationSeconds: 600
+    startupTimeoutSeconds: 600
+
+# Usage:
+# kubectl apply -f 06-example-with-crd-autoscaler.yaml
+# kubectl get llmca llama-3-70b-autoscaler -o yaml
