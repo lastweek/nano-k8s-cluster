@@ -1,0 +1,424 @@
+# Taints and Tolerations for Dedicated Nodes Example
+#
+# This example demonstrates how to use taints and tolerations to dedicate
+# nodes to specific workloads. This is useful for:
+# - GPU-only nodes (no regular workloads)
+# - Production vs development environments
+# - Specialized hardware (FPGA, inference cards)
+# - Compliance requirements (isolation)
+#
+# What you'll learn:
+# - How to taint nodes
+# - How to tolerate taints
+# - NoSchedule vs NoExecute vs NoExecute
+# - Dedicated GPU nodes pattern
+
+---
+# Example 1: GPU-only nodes (NoSchedule)
+#
+# Setup: First taint your GPU nodes:
+#   kubectl taint nodes node-1 gpu-only=true:NoSchedule
+#   kubectl taint nodes node-2 gpu-only=true:NoSchedule
+#   kubectl taint nodes node-3 gpu-only=true:NoSchedule
+#
+# This prevents non-GPU workloads from scheduling to these nodes.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gpu-model-serving
+  labels:
+    app: gpu-model-serving
+    workload-type: gpu
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: gpu-model-serving
+  template:
+    metadata:
+      labels:
+        app: gpu-model-serving
+        workload-type: gpu
+    spec:
+      # Tolerate the gpu-only taint
+      tolerations:
+      - key: "gpu-only"
+        operator: "Equal"
+        value: "true"
+        effect: "NoSchedule"
+
+      # Also select GPU nodes
+      nodeSelector:
+        gpu.node: "true"
+
+      containers:
+      - name: vllm
+        image: vllm/vllm-openai:latest
+        command: ["python", "-m", "vllm.entrypoints.openai.api_server"]
+        args:
+        - --model=meta-llama/Meta-Llama-3-70B
+        - --tensor-parallel-size=4
+        - --host=0.0.0.0
+        - --port=8000
+        ports:
+        - name: http
+          containerPort: 8000
+        resources:
+          requests:
+            nvidia.com/gpu: "4"
+            memory: "64Gi"
+          limits:
+            nvidia.com/gpu: "4"
+            memory: "128Gi"
+
+---
+# Example 2: Production-only nodes (NoExecute)
+#
+# Setup: Taint production nodes:
+#   kubectl taint nodes node-prod-1 env=production:NoExecute
+#   kubectl taint nodes node-prod-2 env=production:NoExecute
+#
+# NoExecute also evicts existing pods that don't tolerate!
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: production-model
+  labels:
+    app: production-model
+    env: production
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: production-model
+      env: production
+  template:
+    metadata:
+      labels:
+        app: production-model
+        env: production
+    spec:
+      # Tolerate production environment taint
+      tolerations:
+      - key: "env"
+        operator: "Equal"
+        value: "production"
+        effect: "NoExecute"
+
+      # Select production nodes
+      nodeSelector:
+        node-type: production
+
+      containers:
+      - name: vllm
+        image: vllm/vllm-openai:latest
+        command: ["python", "-m", "vllm.entrypoints.openai.api_server"]
+        args:
+        - --model=meta-llama/Meta-Llama-3-70B
+        - --host=0.0.0.0
+        - --port=8000
+        ports:
+        - name: http
+          containerPort: 8000
+        resources:
+          requests:
+            nvidia.com/gpu: "4"
+            memory: "64Gi"
+          limits:
+            nvidia.com/gpu: "4"
+            memory: "128Gi"
+        env:
+        - name: ENV
+          value: "production"
+        - name: LOG_LEVEL
+          value: "INFO"
+
+---
+# Example 3: Development workload (should NOT schedule to tainted nodes)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dev-model
+  labels:
+    app: dev-model
+    env: development
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: dev-model
+  template:
+    metadata:
+      labels:
+        app: dev-model
+        env: development
+    spec:
+      # NO tolerations - will avoid tainted nodes
+      nodeSelector:
+        node-type: development
+
+      containers:
+      - name: vllm
+        image: vllm/vllm-openai:latest
+        command: ["python", "-m", "vllm.entrypoints.openai.api_server"]
+        args:
+        - --model=meta-llama/Meta-Llama-3-8B
+        - --host=0.0.0.0
+        - --port=8000
+        ports:
+        - name: http
+          containerPort: 8000
+        resources:
+          requests:
+            nvidia.com/gpu: "1"
+            memory: "16Gi"
+          limits:
+            nvidia.com/gpu: "1"
+            memory: "32Gi"
+        env:
+        - name: ENV
+          value: "development"
+        - name: LOG_LEVEL
+          value: "DEBUG"
+
+---
+# Example 4: Tolerate multiple taints
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: multi-environment-model
+  labels:
+    app: multi-environment-model
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: multi-environment-model
+  template:
+    metadata:
+      labels:
+        app: multi-environment-model
+    spec:
+      # Tolerate multiple taints (can go anywhere!)
+      tolerations:
+      - key: "gpu-only"
+        operator: "Equal"
+        value: "true"
+        effect: "NoSchedule"
+      - key: "env"
+        operator: "Equal"
+        value: "production"
+        effect: "NoExecute"
+      - key: "special-hardware"
+        operator: "Exists"
+        effect: "NoSchedule"
+
+      containers:
+      - name: vllm
+        image: vllm/vllm-openai:latest
+        command: ["sleep", "3600"]
+        resources:
+          requests:
+            nvidia.com/gpu: "1"
+
+---
+# Example 5: Using wildcard toleration (use with caution!)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: can-run-anywhere
+  labels:
+    app: can-run-anywhere
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: can-run-anywhere
+  template:
+    metadata:
+      labels:
+        app: can-run-anywhere
+    spec:
+      # Tolerate ALL taints with operator: Exists
+      tolerations:
+      - operator: "Exists"
+        # No key, no value = match all taints!
+
+      containers:
+      - name: pause
+        image: registry.k8s.io/pause:3.9
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+
+---
+# Example 6: Custom taint for specialized hardware
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: h100-only-workload
+  labels:
+    app: h100-only
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: h100-only
+  template:
+    metadata:
+      labels:
+        app: h100-only
+    spec:
+      # Only schedule to H100 nodes
+      tolerations:
+      - key: "nvidia.com/gpu.product"
+        operator: "Equal"
+        value: "H100"
+        effect: "NoSchedule"
+
+      nodeSelector:
+        nvidia.com/gpu.product: "H100"
+
+      containers:
+      - name: vllm
+        image: vllm/vllm-openai:latest
+        command: ["sleep", "3600"]
+        resources:
+          requests:
+            nvidia.com/gpu: "8"
+
+---
+# How Taints and Tolerations Work:
+#
+# ┌─────────────────────────────────────────────────────────────┐
+# │  Step 1: Taint the Node                                     │
+# │  ┌───────────────────────────────────────────────────────┐ │
+# │  │ kubectl taint nodes node-1 gpu-only=true:NoSchedule  │ │
+# │  │                                                       │ │
+# │  │ Result: Node now has a "taint"                        │ │
+# │  │   → Regular pods CANNOT schedule here                 │ │
+# │  │   → Only pods with toleration CAN schedule here       │ │
+# │  └───────────────────────────────────────────────────────┘ │
+# └─────────────────────────────────────────────────────────────┘
+#                           │
+#                           ▼
+# ┌─────────────────────────────────────────────────────────────┐
+# │  Step 2: Pod Scheduling Decision                            │
+# │  ┌───────────────────────────────────────────────────────┐ │
+# │  │ Pod WITHOUT toleration:                               │ │
+# │  │   → Sees taint → "Can't schedule here!"              │ │
+# │  │   → Tries next node                                   │ │
+# │  │                                                       │ │
+# │  │ Pod WITH toleration:                                  │ │
+# │  │   → Sees taint → "I'm allowed!"                      │ │
+# │  │   → Schedules to tainted node                         │ │
+# │  └───────────────────────────────────────────────────────┘ │
+# └─────────────────────────────────────────────────────────────┘
+#
+# Taint Effects:
+#
+# ┌─────────────────────────────────────────────────────────────┐
+# │  NoSchedule                                                │
+# │  - New pods won't schedule                                │
+# │  - Existing pods stay                                     │
+# │  - Use for: Dedicated nodes, keep existing pods           │
+# └─────────────────────────────────────────────────────────────┘
+#
+# ┌─────────────────────────────────────────────────────────────┐
+# │  PreferNoSchedule                                          │
+# │  - Scheduler tries to avoid                               │
+# │  - Will schedule if necessary                             │
+# │  - Use for: Soft preference                                │
+# └─────────────────────────────────────────────────────────────┘
+#
+# ┌─────────────────────────────────────────────────────────────┐
+# │  NoExecute                                                  │
+# │  - New pods won't schedule                                 │
+# │  - Existing pods are EVICTED!                              │
+# │  - Use for: Immediate isolation, emergency                │
+# └─────────────────────────────────────────────────────────────┘
+#
+# Toleration Operators:
+#
+# Equal  → key=value must match
+# Exists → key must exist (value ignored)
+#        → operator: Exists with no key = match ALL taints
+#
+# Common Patterns:
+#
+# 1. GPU-Only Nodes
+#    kubectl taint nodes <gpu-node> gpu-only=true:NoSchedule
+#    → Only GPU workloads with toleration can use
+#
+# 2. Production Isolation
+#    kubectl taint nodes <prod-node> env=production:NoExecute
+#    → Dev workloads evicted, only production can run
+#
+# 3. Hardware Dedication
+#    kubectl taint nodes <h100-node> gpu-type=H100:NoSchedule
+#    → Only H100 workloads can use H100 nodes
+#
+# 4. Maintenance Mode
+#    kubectl taint nodes <node> maintenance:NoExecute
+#    → All pods evicted, node drained
+#
+# Testing:
+#
+# 1. Taint a node:
+#    kubectl taint nodes node-1 gpu-only=true:NoSchedule
+#
+# 2. Check taints on all nodes:
+#    kubectl describe nodes | grep -A 5 Taints
+#
+# 3. Deploy workload without toleration:
+#    kubectl apply -f 06-taints-tolerations-dedicated-nodes.yaml
+#    # dev-model should NOT schedule to tainted nodes
+#
+# 4. Deploy workload with toleration:
+#    # gpu-model-serving SHOULD schedule to tainted nodes
+#
+# 5. Check where pods scheduled:
+#    kubectl get pods -o wide
+#
+# 6. Remove taint:
+#    kubectl taint nodes node-1 gpu-only=true:NoSchedule-
+#    # (note the trailing -)
+#
+# Real-World Example: GPU Cluster Setup
+#
+# # Taint all GPU nodes
+# for node in $(kubectl get nodes -l gpu.node=true -o name); do
+#   kubectl taint $node gpu-only=true:NoSchedule
+# done
+#
+# # Taint H100 nodes separately
+# for node in $(kubectl get nodes -l nvidia.com/gpu.product=H100 -o name); do
+#   kubectl taint $node gpu-type=H100:NoSchedule
+# done
+#
+# # Result:
+# # - Non-GPU workloads stay on CPU nodes
+# # - GPU workloads can use any GPU node
+# # - H100 workloads only on H100 nodes
+# # - Perfect hardware isolation!
+#
+# Comparison with nodeSelector:
+#
+# ┌─────────────────────────────────────────────────────────────┐
+# │  nodeSelector                                               │
+# │  - Pod requests specific labels                            │
+# │  - "I want to go to GPU nodes"                             │
+# │  - Other pods can still come to GPU nodes                  │
+# └─────────────────────────────────────────────────────────────┘
+#
+# ┌─────────────────────────────────────────────────────────────┐
+# │  Taints + Tolerations                                       │
+# │  - Node rejects unwanted pods                              │
+# │  - "Only GPU workloads allowed here!"                      │
+# │  - Excludes all non-tolerating pods                        │
+# └─────────────────────────────────────────────────────────────┘
+#
+# Use BOTH for complete control!

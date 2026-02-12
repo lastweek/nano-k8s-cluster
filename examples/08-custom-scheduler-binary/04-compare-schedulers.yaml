@@ -1,0 +1,243 @@
+# Compare Default vs Custom Scheduler
+#
+# This example demonstrates the differences between:
+# 1. Default Kubernetes scheduler (kube-scheduler)
+# 2. User-defined scheduling (07-user-defined-scheduling)
+# 3. Custom scheduler binary (this folder)
+#
+# Each approach has different capabilities and use cases.
+
+---
+# Scenario: 3 pods competing for 2 GPU nodes
+
+---
+# Pod 1: Uses default scheduler
+apiVersion: v1
+kind: Pod
+metadata:
+  name: compare-default-scheduler
+  labels:
+    app: compare
+    scheduler-type: default
+spec:
+  # Empty or "default-scheduler" uses kube-scheduler
+  schedulerName: ""
+
+  nodeSelector:
+    gpu.node: "true"
+
+  containers:
+  - name: pause
+    image: registry.k8s.io/pause:3.9
+    resources:
+      requests:
+        nvidia.com/gpu: "1"
+
+---
+# Pod 2: Uses simple custom scheduler
+apiVersion: v1
+kind: Pod
+metadata:
+  name: compare-simple-custom
+  labels:
+    app: compare
+    scheduler-type: simple-custom
+spec:
+  schedulerName: "simple-custom-scheduler"
+
+  nodeSelector:
+    gpu.node: "true"
+
+  containers:
+  - name: pause
+    image: registry.k8s.io/pause:3.9
+    resources:
+      requests:
+        nvidia.com/gpu: "1"
+
+---
+# Pod 3: Uses GPU-aware custom scheduler
+apiVersion: v1
+kind: Pod
+metadata:
+  name: compare-gpu-aware
+  labels:
+    app: compare
+    scheduler-type: gpu-aware
+spec:
+  schedulerName: "gpu-aware-scheduler"
+
+  nodeSelector:
+    gpu.node: "true"
+
+  containers:
+  - name: vllm
+    image: vllm/vllm-openai:latest
+    command: ["sleep", "3600"]
+    env:
+    - name: TENSOR_PARALLEL_SIZE
+      value: "2"
+    resources:
+      requests:
+        nvidia.com/gpu: "2"
+
+---
+# Comparison Documentation
+
+# ┌─────────────────────────────────────────────────────────────────┐
+# │  Scheduler Comparison Matrix                                    │
+# ├─────────────────────────────────────────────────────────────────┤
+# │                                                                  │
+# │  1. Default kube-scheduler (Pod 1)                              │
+# │  ┌───────────────────────────────────────────────────────────┐ │
+# │  │ How it works:                                            │ │
+# │  │ - Built-in scheduling plugins                            │ │
+# │  │ - Spreads pods across nodes (default)                    │ │
+# │  │ - Uses nodeSelector for GPU nodes                        │ │
+# │  │                                                          │ │
+# │  │ Pros:                                                    │ │
+# │  │ ✓ No code to maintain                                    │ │
+# │  │ ✓ Well-tested                                           │ │
+# │  │ ✓ Supports all K8s features                             │ │
+# │  │                                                          │ │
+# │  │ Cons:                                                    │ │
+# │  │ ✗ Can't track real-time GPU utilization                │ │
+# │  │ ✗ Can't implement custom algorithms                    │ │
+# │  │ ✗ Limited to built-in features                         │ │
+# │  └───────────────────────────────────────────────────────────┘ │
+# │                                                                  │
+# │  2. Simple Custom Scheduler (Pod 2)                            │
+# │  ┌───────────────────────────────────────────────────────────┐ │
+# │  │ How it works:                                            │ │
+# │  │ - Your Go code watches pod API                           │ │
+# │  │ - Filters and scores nodes                               │ │
+# │  │ - Binds pod to best node                                 │ │
+# │  │                                                          │ │
+# │  │ Pros:                                                    │ │
+# │  │ ✓ You control the logic                                  │ │
+# │  │ ✓ Can add custom scoring                                │ │
+# │  │ ✓ Can integrate external metrics                        │ │
+# │  │                                                          │ │
+# │  │ Cons:                                                    │ │
+# │  │ ✗ Must maintain code                                    │ │
+# │  │ ✗ More complex to debug                                 │ │
+# │  │ ✗ Need to understand K8s API deeply                     │ │
+# │  └───────────────────────────────────────────────────────────┘ │
+# │                                                                  │
+# │  3. GPU-Aware Custom Scheduler (Pod 3)                         │
+# │  ┌───────────────────────────────────────────────────────────┐ │
+# │  │ How it works:                                            │ │
+# │  │ - Python code queries DCGM for GPU metrics               │ │
+# │  │ - Builds NVLink topology graph                          │ │
+# │  │ - Optimizes multi-GPU placement                          │ │
+# │  │                                                          │ │
+# │  │ Pros:                                                    │ │
+# │  │ ✓ Real-time GPU utilization                             │ │
+# │  │ ✓ NVLink topology awareness                             │ │
+# │  │ ✓ Multi-GPU optimization                                │ │
+# │  │                                                          │ │
+# │  │ Cons:                                                    │ │
+# │  │ ✗ Most complex                                          │ │
+# │  │ ✗ Requires DCGM exporter                               │ │
+# │  │ ✗ Python runtime (slower than Go)                      │ │
+# │  └───────────────────────────────────────────────────────────┘ │
+# └─────────────────────────────────────────────────────────────────┘
+
+# Test Scenario:
+#
+# Given: 2 GPU nodes, each with 4 GPUs
+#
+# ┌─────────────────────────────────────────────────────────────┐
+# │  Node Allocation with 3 Competing Pods                      │
+│  ┌───────────────────────────────────────────────────────────┐ │
+# │  │ kube-scheduler (Pod 1):                                  │ │
+# │  │   - Spreads across nodes (default behavior)             │ │
+# │  │   → Node A, GPU 0                                       │ │
+# │  │                                                          │ │
+# │  │ simple-custom (Pod 2):                                   │ │
+# │  │   - Scores by resource availability                     │ │
+# │  │   → Node B, GPU 0 (less utilized)                       │ │
+# │  │                                                          │ │
+# │  │ gpu-aware (Pod 3):                                       │ │
+# │  │   - Queries DCGM for GPU memory                         │ │
+# │  │   - Finds 2 contiguous GPUs                             │ │
+# │  │   → Node B, GPU 1-2 (NVLink connected)                  │ │
+# │  └───────────────────────────────────────────────────────────┘ │
+# └─────────────────────────────────────────────────────────────┘
+
+# How to Test:
+#
+# 1. Deploy custom schedulers:
+#    kubectl apply -f 03-deploy-custom-scheduler.yaml
+#
+# 2. Wait for schedulers to be ready:
+#    kubectl wait --for=condition=ready pod -l 'app in (simple-custom-scheduler,gpu-aware-scheduler)' --timeout=120s
+#
+# 3. Deploy test pods:
+#    kubectl apply -f 04-compare-schedulers.yaml
+#
+# 4. Watch scheduling:
+#    kubectl get pods -l app=compare -o wide --watch
+#
+# 5. Check each pod's scheduler:
+#    kubectl get pods -l app=compare -o custom-columns=NAME:.metadata.name,SCHEDULER:.spec.schedulerName,NODE:.spec.nodeName
+#
+# 6. Compare results:
+#    kubectl get pods -l app=compare -o wide
+#
+# Expected Output:
+# NAME                          SCHEDULER                   NODE
+# compare-default-scheduler     default-scheduler           node-a
+# compare-simple-custom         simple-custom-scheduler     node-b
+# compare-gpu-aware             gpu-aware-scheduler         node-b
+#
+# Key Observations:
+# 1. All 3 pods scheduled successfully
+# 2. Each used a different scheduler
+# 3. GPU-aware pod optimized for NVLink topology
+# 4. Simple scheduler picked node with more free resources
+# 5. Default scheduler used spread strategy
+
+# Performance Comparison:
+#
+# ┌─────────────────────────────────────────────────────────────┐
+# │  Scheduling Latency (Time to schedule 100 pods)             │
+│  ┌───────────────────────────────────────────────────────────┐ │
+# │  │ kube-scheduler:        ~10ms per pod                    │ │
+# │  │ simple-custom:         ~50ms per pod                    │ │
+# │  │ gpu-aware:            ~200ms per pod (DCGM query)       │ │
+# │  └───────────────────────────────────────────────────────────┘ │
+# └─────────────────────────────────────────────────────────────┘
+#
+# Trade-off: GPU-aware scheduler is slower but makes better decisions!
+
+# When to Use Each:
+#
+# ┌─────────────────────────────────────────────────────────────┐
+# │  Use kube-scheduler when:                                    │
+# │  ✓ You have simple scheduling requirements                  │
+# │  ✓ You don't need real-time GPU metrics                     │
+# │  ✓ You want to avoid maintaining code                       │
+# │  Example: Web services, databases, general workloads       │
+# └─────────────────────────────────────────────────────────────┘
+#
+# ┌─────────────────────────────────────────────────────────────┐
+# │  Use user-defined scheduling (07-folder) when:              │
+# │  ✓ You need GPU type selection                              │
+# │  ✓ You need pod co-location                                 │
+# │  ✓ You need zone spreading                                  │
+# │  Example: Most GPU workloads                                │
+# └─────────────────────────────────────────────────────────────┘
+#
+# ┌─────────────────────────────────────────────────────────────┐
+# │  Use custom scheduler binary (this folder) when:             │
+# │  ✓ You need real-time GPU utilization                       │
+# │  ✓ You need custom placement algorithms                     │
+# │  ✓ You need topology-aware scheduling                       │
+# │  Example: Large-scale LLM serving, NVIDIA Dynamo            │
+# └─────────────────────────────────────────────────────────────┘
+
+# Clean up:
+#
+# kubectl delete -f 04-compare-schedulers.yaml
+# kubectl delete -f 03-deploy-custom-scheduler.yaml

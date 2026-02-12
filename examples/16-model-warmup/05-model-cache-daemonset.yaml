@@ -1,0 +1,192 @@
+# Strategy 4: Model Cache DaemonSet
+#
+# This strategy uses a DaemonSet to pre-download and cache models
+# on all nodes. When vLLM pods start, the model is already on disk.
+#
+# Benefit: Reduces model loading time by 40-60% (no download needed)
+# Trade-off: Uses disk space on all nodes
+#
+# Note: This is especially useful when using PersistentVolumes
+# or hostPath for shared model storage.
+
+---
+# DaemonSet to cache models on all nodes
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: model-cacher
+  labels:
+    app: model-cacher
+spec:
+  selector:
+    matchLabels:
+      app: model-cacher
+  template:
+    metadata:
+      labels:
+        app: model-cacher
+    spec:
+      # Use host directory for model cache
+      volumes:
+      - name: model-cache
+        hostPath:
+          path: /var/lib/vllm-models
+          type: DirectoryOrCreate
+      containers:
+      - name: cacher
+        image: python:3.11-slim
+        command: ["python", "-c"]
+        # This script simulates downloading models
+        # In production, you'd use:
+        # - huggingface-cli download
+        # - aws s3 sync
+        # - gsutil -m cp
+        args:
+        - |
+          import os
+          import time
+          import logging
+          from pathlib import Path
+
+          logging.basicConfig(level=logging.INFO)
+          logger = logging.getLogger(__name__)
+
+          MODEL_DIR = "/models"
+          MODELS = [
+              "meta-llama/Llama-3-70B",
+              "meta-llama/Llama-3-8B",
+              "mistralai/Mistral-7B"
+          ]
+
+          os.makedirs(MODEL_DIR, exist_ok=True)
+
+          logger.info("Model cacher starting...")
+          logger.info(f"Cache directory: {MODEL_DIR}")
+
+          # Simulate model download
+          for model in MODELS:
+              model_path = os.path.join(MODEL_DIR, model.replace("/", "--"))
+
+              if os.path.exists(model_path):
+                  logger.info(f"Model already cached: {model}")
+                  continue
+
+              logger.info(f"Caching model: {model}")
+              os.makedirs(model_path, exist_ok=True)
+
+              # Simulate download with progress
+              size_gb = 140  # Simulated model size
+              for i in range(10):
+                  time.sleep(2)
+                  progress = (i + 1) * 10
+                  logger.info(f"  Downloading {model}: {progress}% ({size_gb * progress / 100:.1f} GB)")
+
+              # Create marker file
+              marker = os.path.join(model_path, ".cached")
+              with open(marker, "w") as f:
+                  f.write(f"Cached at: {time.ctime()}")
+
+              logger.info(f"Model cached: {model}")
+
+          logger.info("All models cached!")
+
+          # Keep container alive to maintain the cache
+          logger.info("Keeping container alive to maintain cache...")
+          while True:
+              time.sleep(3600)
+              logger.info("Cache still alive...")
+        env:
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        volumeMounts:
+        - name: model-cache
+          mountPath: /models
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "256Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+---
+# Deployment that uses the cached models
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-cached
+  labels:
+    app: vllm
+    warmup: "cached"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vllm
+      warmup: "cached"
+  template:
+    metadata:
+      labels:
+        app: vllm
+        warmup: "cached"
+    spec:
+      # Mount the cached model directory
+      volumes:
+      - name: model-cache
+        hostPath:
+          path: /var/lib/vllm-models
+          type: Directory
+      containers:
+      - name: vllm
+        image: vllm-warmup-test:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8000
+          name: http
+        env:
+        - name: MODEL_NAME
+          value: "meta-llama/Llama-3-70B"
+        # Reduced loading time because model is cached
+        - name: MODEL_LOADING_TIME
+          value: "15"  # 15s instead of 30s (50% faster)
+        - name: WARMUP_REQUEST_TIME
+          value: "1"
+        - name: MODEL_CACHE_DIR
+          value: "/models"
+        volumeMounts:
+        - name: model-cache
+          mountPath: /models
+          readOnly: true
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8000
+          initialDelaySeconds: 5
+          periodSeconds: 3
+          failureThreshold: 10  # Faster timeout since model loads faster
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 15
+          periodSeconds: 10
+          failureThreshold: 3
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "2Gi"
+          limits:
+            cpu: "2"
+            memory: "4Gi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-cached
+spec:
+  selector:
+    app: vllm
+    warmup: "cached"
+  ports:
+  - port: 80
+    targetPort: 8000
+  type: ClusterIP

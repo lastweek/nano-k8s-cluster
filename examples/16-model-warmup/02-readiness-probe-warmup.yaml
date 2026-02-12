@@ -1,0 +1,81 @@
+# Strategy 1: Readiness Probe Warm-up
+#
+# This deployment uses a readiness probe that checks if the model is actually loaded.
+# The pod only becomes "Ready" AFTER the model is fully loaded.
+#
+# Benefit: First request after pod is "Ready" will be fast.
+# Trade-off: Pod takes longer to be marked as "Ready".
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-readiness-probe
+  labels:
+    app: vllm
+    warmup: "readiness-probe"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vllm
+      warmup: "readiness-probe"
+  template:
+    metadata:
+      labels:
+        app: vllm
+        warmup: "readiness-probe"
+    spec:
+      containers:
+      - name: vllm
+        image: vllm-warmup-test:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8000
+          name: http
+        env:
+        - name: MODEL_NAME
+          value: "meta-llama/Llama-3-70B"
+        - name: MODEL_LOADING_TIME
+          value: "30"  # Simulated 30s loading time
+        - name: WARMUP_REQUEST_TIME
+          value: "1"
+        # KEY: Readiness probe checks /ready endpoint
+        # This endpoint returns 200 OK only when model is loaded
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8000
+          initialDelaySeconds: 5    # Start checking after 5 seconds
+          periodSeconds: 3           # Check every 3 seconds
+          timeoutSeconds: 2          # Timeout after 2 seconds
+          failureThreshold: 20       # Allow up to 60 seconds for model to load (20 * 3s)
+          successThreshold: 1        # Need 1 successful check to be ready
+        # Liveness probe ensures container is healthy
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 15
+          periodSeconds: 10
+          timeoutSeconds: 2
+          failureThreshold: 3
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "2Gi"
+          limits:
+            cpu: "2"
+            memory: "4Gi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-readiness-probe
+spec:
+  selector:
+    app: vllm
+    warmup: "readiness-probe"
+  ports:
+  - port: 80
+    targetPort: 8000
+  type: ClusterIP

@@ -1,0 +1,787 @@
+# 06: Dynamo-Like Complete Architecture
+#
+# This example shows a complete architecture similar to NVIDIA Dynamo.
+# It combines all previous patterns into a production-ready multi-node serving system.
+#
+# Components:
+# - Request Queue (buffers incoming requests)
+# - Router Layer (load balances ACROSS model instances)
+# - Multiple StatefulSets (each = one model instance with TP)
+# - Coordination (distributed initialization within each instance)
+# - Monitoring & Observability
+#
+# This is how NVIDIA Dynamo serves large LLMs in production!
+
+---
+# ============================================
+# LAYER 1: Request Queue
+# ============================================
+#
+# Buffers incoming requests before they reach the model pods.
+# Provides:
+# - Priority queue (high priority requests first)
+# - Request batching (group similar requests)
+# - Timeout management
+# - Load shedding (reject when overloaded)
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: queue-config
+data:
+  queue.capacity: "1000"
+  queue.priority.levels: "3"
+  queue.batch.size: "32"
+  queue.timeout.seconds: "300"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llama-request-queue
+  labels:
+    app: llama-70b
+    component: queue
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: llama-70b
+      component: queue
+  template:
+    metadata:
+      labels:
+        app: llama-70b
+        component: queue
+    spec:
+      affinity:
+        # Spread queue pods
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - llama-70b
+                  - key: component
+                    operator: In
+                    values:
+                    - queue
+              topologyKey: kubernetes.io/hostname
+      containers:
+      - name: queue
+        image: redis:7-alpine
+        command: ["redis-server"]
+        args:
+        - --maxmemory
+        - "2gb"
+        - --maxmemory-policy
+        - "allkeys-lru"
+        - --save
+        - ""
+        - --appendonly
+        - "yes"
+        ports:
+        - name: queue
+          containerPort: 6379
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "2Gi"
+          limits:
+            cpu: "2000m"
+            memory: "4Gi"
+        livenessProbe:
+          exec:
+            command:
+            - redis-cli
+            - ping
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          exec:
+            command:
+            - redis-cli
+            - ping
+          initialDelaySeconds: 5
+          periodSeconds: 5
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: llama-request-queue
+  labels:
+    app: llama-70b
+    component: queue
+spec:
+  clusterIP: None  # Headless for direct access
+  ports:
+  - name: queue
+    port: 6379
+  selector:
+    app: llama-70b
+    component: queue
+
+---
+# ============================================
+# LAYER 2: MODEL INSTANCE A
+# ============================================
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: llama-70b-instance-a-backend
+  labels:
+    app: llama-70b
+    instance: a
+    component: backend
+spec:
+  clusterIP: None
+  ports:
+  - name: http
+    port: 8000
+  - name: coord
+    port: 9090
+  - name: p2p
+    port: 5000
+  selector:
+    app: llama-70b
+    instance: a
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: llama-70b-instance-a
+  labels:
+    app: llama-70b
+    instance: a
+    component: backend
+spec:
+  serviceName: llama-70b-instance-a-backend
+  replicas: 2  # 2 nodes × 4 GPUs = 8 GPUs for ONE model instance
+  podManagementPolicy: OrderedReady
+  selector:
+    matchLabels:
+      app: llama-70b
+      instance: a
+  template:
+    metadata:
+      labels:
+        app: llama-70b
+        instance: a
+        component: backend
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values:
+                - llama-70b
+              - key: instance
+                operator: In
+                values:
+                - a
+            topologyKey: kubernetes.io/hostname
+      nodeSelector:
+        gpu.node: "true"
+
+      # Init container for coordination
+      initContainers:
+      - name: wait-coordinator
+        image: busybox:1.36
+        command:
+        - sh
+        - -c
+        - |
+          if [ "$HOSTNAME" != "llama-70b-instance-a-0" ]; then
+            echo "Waiting for coordinator..."
+            until nslookup llama-70b-instance-a-0.llama-70b-instance-a-backend.default.svc.cluster.local:9090; do sleep 2; done
+            until wget -q --spider http://llama-70b-instance-a-0.llama-70b-instance-a-backend.default.svc.cluster.local:9090/ready 2>/dev/null; do
+              echo "Waiting for ready signal..."
+              sleep 5
+            done
+          fi
+
+      containers:
+      # Coordinator sidecar
+      - name: coordinator
+        image: busybox:1.36
+        command:
+        - sh
+        - -c
+        - |
+          ORDINAL=${HOSTNAME##*-}
+          if [ "$ORDINAL" = "0" ]; then
+            # Coordinator
+            echo "100" > /tmp/rank
+            # Wait for all pods
+            while true; do
+              READY=0
+              for i in $(seq 0 $((REPLICAS-1))); do
+                if wget -q --spider --timeout=2 http://llama-70b-instance-a-${i}.llama-70b-instance-a-backend.default.svc.cluster.local:9090/heartbeat 2>/dev/null; then
+                  READY=$((READY+1))
+                fi
+              done
+              if [ "$READY" = "$REPLICAS" ]; then
+                echo "All pods ready" > /tmp/ready
+                sleep 10
+              else
+                sleep 2
+              fi
+            done
+          else
+            # Worker
+            echo $ORDINAL > /tmp/rank
+            while true; do
+              if wget -q --spider http://llama-70b-instance-a-0.llama-70b-instance-a-backend.default.svc.cluster.local:9090/ready 2>/dev/null; then
+                break
+              fi
+              sleep 2
+            done
+            sleep 3600
+          fi
+        env:
+        - name: REPLICAS
+          value: "2"
+        ports:
+        - name: coord
+          containerPort: 9090
+
+      # Main vLLM container
+      - name: vllm
+        image: vllm/vllm-openai:latest
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          POD_ORDINAL=$(echo $HOSTNAME | cut -d- -f3)
+          echo "Pod ordinal: $POD_ORDINAL"
+          export POD_ORDINAL
+          exec python -m vllm.entrypoints.openai.api_server \
+            --model=meta-llama/Meta-Llama-3-70B \
+            --tensor-parallel-size=8 \
+            --host=0.0.0.0 \
+            --port=8000 \
+            --block-size=8 \
+            --max-model-len=4096 \
+            --dtype=half
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: MASTER_ADDR
+          value: "llama-70b-instance-a-0.llama-70b-instance-a-backend.default.svc.cluster.local"
+        - name: MASTER_PORT
+          value: "5000"
+        - name: CUDA_VISIBLE_DEVICES
+          value: "0,1,2,3"
+        ports:
+        - name: http
+          containerPort: 8000
+        - name: p2p
+          containerPort: 5000
+        volumeMounts:
+        - name: shm
+          mountPath: /dev/shm
+        resources:
+          requests:
+            nvidia.com/gpu: "4"
+            cpu: "16"
+            memory: "64Gi"
+          limits:
+            nvidia.com/gpu: "4"
+            memory: "128Gi"
+        startupProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 120
+          periodSeconds: 10
+          failureThreshold: 60
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 60
+          periodSeconds: 10
+      volumes:
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 16Gi
+
+---
+# Service to expose Instance A (rank-0)
+apiVersion: v1
+kind: Service
+metadata:
+  name: llama-70b-instance-a
+  labels:
+    app: llama-70b
+    instance: a
+    component: backend
+spec:
+  type: ClusterIP
+  ports:
+  - name: http
+    port: 8000
+    targetPort: 8000
+  selector:
+    app: llama-70b
+    instance: a
+    component: backend
+
+---
+# ============================================
+# LAYER 3: MODEL INSTANCE B
+# ============================================
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: llama-70b-instance-b-backend
+  labels:
+    app: llama-70b
+    instance: b
+    component: backend
+spec:
+  clusterIP: None
+  ports:
+  - name: http
+    port: 8000
+  - name: coord
+    port: 9090
+  - name: p2p
+    port: 5000
+  selector:
+    app: llama-70b
+    instance: b
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: llama-70b-instance-b
+  labels:
+    app: llama-70b
+    instance: b
+    component: backend
+spec:
+  serviceName: llama-70b-instance-b-backend
+  replicas: 2  # 2 nodes × 4 GPUs = 8 GPUs for ONE model instance
+  podManagementPolicy: OrderedReady
+  selector:
+    matchLabels:
+      app: llama-70b
+      instance: b
+  template:
+    metadata:
+      labels:
+        app: llama-70b
+        instance: b
+        component: backend
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values:
+                - llama-70b
+              - key: instance
+                operator: In
+                values:
+                - b
+            topologyKey: kubernetes.io/hostname
+      nodeSelector:
+        gpu.node: "true"
+
+      initContainers:
+      - name: wait-coordinator
+        image: busybox:1.36
+        command:
+        - sh
+        - -c
+        - |
+          if [ "$HOSTNAME" != "llama-70b-instance-b-0" ]; then
+            echo "Waiting for coordinator..."
+            until nslookup llama-70b-instance-b-0.llama-70b-instance-b-backend.default.svc.cluster.local:9090; do sleep 2; done
+            until wget -q --spider http://llama-70b-instance-b-0.llama-70b-instance-b-backend.default.svc.cluster.local:9090/ready 2>/dev/null; do
+              echo "Waiting for ready signal..."
+              sleep 5
+            done
+          fi
+
+      containers:
+      - name: coordinator
+        image: busybox:1.36
+        command:
+        - sh
+        - -c
+        - |
+          ORDINAL=${HOSTNAME##*-}
+          if [ "$ORDINAL" = "0" ]; then
+            echo "100" > /tmp/rank
+            while true; do
+              READY=0
+              for i in $(seq 0 $((REPLICAS-1))); do
+                if wget -q --spider --timeout=2 http://llama-70b-instance-b-${i}.llama-70b-instance-b-backend.default.svc.cluster.local:9090/heartbeat 2>/dev/null; then
+                  READY=$((READY+1))
+                fi
+              done
+              if [ "$READY" = "$REPLICAS" ]; then
+                echo "All pods ready" > /tmp/ready
+                sleep 10
+              else
+                sleep 2
+              fi
+            done
+          else
+            echo $ORDINAL > /tmp/rank
+            while true; do
+              if wget -q --spider http://llama-70b-instance-b-0.llama-70b-instance-b-backend.default.svc.cluster.local:9090/ready 2>/dev/null; then
+                break
+              fi
+              sleep 2
+            done
+            sleep 3600
+          fi
+        env:
+        - name: REPLICAS
+          value: "2"
+        ports:
+        - name: coord
+          containerPort: 9090
+
+      - name: vllm
+        image: vllm/vllm-openai:latest
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          POD_ORDINAL=$(echo $HOSTNAME | cut -d- -f3)
+          echo "Pod ordinal: $POD_ORDINAL"
+          export POD_ORDINAL
+          exec python -m vllm.entrypoints.openai.api_server \
+            --model=meta-llama/Meta-Llama-3-70B \
+            --tensor-parallel-size=8 \
+            --host=0.0.0.0 \
+            --port=8000 \
+            --block-size=8 \
+            --max-model-len=4096 \
+            --dtype=half
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: MASTER_ADDR
+          value: "llama-70b-instance-b-0.llama-70b-instance-b-backend.default.svc.cluster.local"
+        - name: MASTER_PORT
+          value: "5000"
+        - name: CUDA_VISIBLE_DEVICES
+          value: "0,1,2,3"
+        ports:
+        - name: http
+          containerPort: 8000
+        - name: p2p
+          containerPort: 5000
+        volumeMounts:
+        - name: shm
+          mountPath: /dev/shm
+        resources:
+          requests:
+            nvidia.com/gpu: "4"
+            cpu: "16"
+            memory: "64Gi"
+          limits:
+            nvidia.com/gpu: "4"
+            memory: "128Gi"
+        startupProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 120
+          periodSeconds: 10
+          failureThreshold: 60
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 60
+          periodSeconds: 10
+      volumes:
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 16Gi
+
+---
+# Service to expose Instance B (rank-0)
+apiVersion: v1
+kind: Service
+metadata:
+  name: llama-70b-instance-b
+  labels:
+    app: llama-70b
+    instance: b
+    component: backend
+spec:
+  type: ClusterIP
+  ports:
+  - name: http
+    port: 8000
+    targetPort: 8000
+  selector:
+    app: llama-70b
+    instance: b
+    component: backend
+
+---
+# ============================================
+# LAYER 4: Router / Load Balancer
+# ============================================
+# Router balances ACROSS MODEL INSTANCES, not within them!
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: router-config
+data:
+  nginx.conf: |
+    upstream dynamo_backend {
+        # Load balance ACROSS MODEL INSTANCES
+        # Each service points to rank-0 of a different model instance
+        least_conn;
+        server llama-70b-instance-a:8000 max_fails=2 fail_timeout=30s;
+        server llama-70b-instance-b:8000 max_fails=2 fail_timeout=30s;
+        keepalive 32;
+        keepalive_timeout 60s;
+    }
+
+    server {
+        listen 8080;
+        server_name _;
+
+        location /health {
+            return 200 "OK\n";
+            access_log off;
+        }
+
+        location /queue {
+            proxy_pass http://llama-request-queue:6379;
+        }
+
+        location / {
+            proxy_pass http://dynamo_backend;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_connect_timeout 300s;
+            proxy_send_timeout 300s;
+            proxy_read_timeout 300s;
+            proxy_buffering off;
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+        }
+    }
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llama-router
+  labels:
+    app: llama-70b
+    component: router
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: llama-70b
+      component: router
+  template:
+    metadata:
+      labels:
+        app: llama-70b
+        component: router
+    spec:
+      containers:
+      - name: router
+        image: nginx:alpine
+        ports:
+        - name: http
+          containerPort: 8080
+        volumeMounts:
+        - name: config
+          mountPath: /etc/nginx/conf.d
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "512Mi"
+          limits:
+            cpu: "2000m"
+            memory: "2Gi"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+      volumes:
+      - name: config
+        configMap:
+          name: router-config
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: llama-70b-router
+  labels:
+    app: llama-70b
+    component: router
+spec:
+  type: ClusterIP
+  ports:
+  - name: http
+    port: 8000
+    targetPort: 8080
+  selector:
+    app: llama-70b
+    component: router
+
+---
+# ============================================
+# LAYER 5: Monitoring
+# ============================================
+
+# ServiceMonitor for Prometheus
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: llama-70b
+  labels:
+    app: llama-70b
+spec:
+  selector:
+    matchLabels:
+      app: llama-70b
+  endpoints:
+  - port: http
+    path: /metrics
+    interval: 30s
+
+---
+# Complete Architecture Diagram:
+#
+# ┌─────────────────────────────────────────────────────────────────┐
+# │  Dynamo-Like Multi-Instance Architecture                        │
+# │  ┌───────────────────────────────────────────────────────────┐  │
+# │  │                                                           │  │
+# │  │  Client Request                                           │  │
+# │  │       ↓                                                   │  │
+# │  │  ┌─────────────────────────────────────────────────────┐ │  │
+# │  │  │ LAYER 1: Request Queue (Redis)                      │ │  │
+# │  │  │ - Priority queue                                      │ │  │
+# │  │  │ - Batching                                           │ │  │
+# │  │  │ - Timeout management                                 │ │  │
+# │  │  └─────────────────────────────────────────────────────┘ │  │
+# │  │       ↓                                                   │  │
+# │  │  ┌─────────────────────────────────────────────────────┐ │  │
+# │  │  │ LAYER 2: Router (Nginx)                             │ │  │
+# │  │  │ - Load balancing ACROSS INSTANCES                   │ │  │
+# │  │  │ - Health checking                                    │ │  │
+# │  │  │ - Circuit breaking                                   │ │  │
+# │  │  └─────────────────────────────────────────────────────┘ │  │
+# │  │       ↓                                                   │  │
+# │  │  ┌─────────────────────┐  ┌─────────────────────────────┐│  │
+# │  │  │ Instance A           │  │ Instance B                 ││  │
+# │  │  │ StatefulSet (2 pods) │  │ StatefulSet (2 pods)       ││  │
+# │  │  │ ┌─────────────────┐ │  │ ┌─────────────────────────┐ ││  │
+# │  │  │ │Pod-A0 (rank 0)  │ │  │ │Pod-B0 (rank 0)          │ ││  │
+# │  │  │ │4x H100 GPUs     │ │  │ │4x H100 GPUs            │ ││  │
+# │  │  │ │Coordinator      │ │  │ │Coordinator             │ ││  │
+# │  │  │ └─────────────────┘ │  │ └─────────────────────────┘ ││  │
+# │  │  │ ┌─────────────────┐ │  │ ┌─────────────────────────┐ ││  │
+# │  │  │ │Pod-A1 (rank 1)  │ │  │ │Pod-B1 (rank 1)          │ ││  │
+# │  │  │ │4x H100 GPUs     │ │  │ │4x H100 GPUs            │ ││  │
+# │  │  │ │Worker (TP)      │ │  │ │Worker (TP)             │ ││  │
+# │  │  │ └─────────────────┘ │  │ └─────────────────────────┘ ││  │
+# │  │  │       │              │  │              │              ││  │
+# │  │  │    TP=8 (2×4 GPUs)   │  │    TP=8 (2×4 GPUs)         ││  │
+# │  │  └─────────────────────┘  └─────────────────────────────┘│  │
+# │  │       ↓                              ↓                   │  │
+# │  │  Router balances: instance-a ↔ instance-b                │  │
+# │  │                                                           │  │
+# │  │  Total: 2 model instances, 4 pods, 16 GPUs               │  │
+# │  │                                                           │  │
+# │  └───────────────────────────────────────────────────────────┘  │
+# └─────────────────────────────────────────────────────────────────┘
+#
+# Key Differences from Single Instance:
+#
+# ┌─────────────────────────────────────────────────────────────┐
+# │  Wrong: Single Instance with Router                          │
+# │  ┌───────────────────────────────────────────────────────┐  │
+# │  │ StatefulSet: 2 pods                                     │  │
+# │  │ Router balances: pod-0 ↔ pod-1                         │  │
+# │  │                                                         │  │
+# │  │ Problem: For TP, only rank-0 receives requests!        │  │
+# │  │          Balancing to pod-1 won't work!                │  │
+# │  └───────────────────────────────────────────────────────┘  │
+# └─────────────────────────────────────────────────────────────┘
+#                           │
+#                           ▼
+# ┌─────────────────────────────────────────────────────────────┐
+# │  Correct: Multi-Instance with Router                         │
+# │  ┌───────────────────────────────────────────────────────┐  │
+# │  │ Instance A StatefulSet (2 pods, TP=8)                  │  │
+# │  │ Instance B StatefulSet (2 pods, TP=8)                  │  │
+# │  │                                                         │  │
+# │  │ Router balances: instance-a (rank-0) ↔ instance-b (rank-0)│ │
+# │  │                                                         │  │
+# │  │ Each instance is independent!                          │  │
+# │  │ Scale by adding Instance C, D, E...                    │  │
+# │  └───────────────────────────────────────────────────────┘  │
+# └─────────────────────────────────────────────────────────────┘
+#
+# Deployment:
+#
+# 1. Apply all layers:
+#    kubectl apply -f 06-dynamo-like.yaml
+#
+# 2. Wait for full startup:
+#    kubectl wait --for=condition=ready pod -l app=llama-70b --timeout=600s
+#
+# 3. Check all components:
+#    kubectl get pods -l app=llama-70b -L component,instance
+#
+# 4. Port forward:
+#    kubectl port-forward svc/llama-70b-router 8000:8000
+#
+# 5. Test inference:
+#    curl http://localhost:8000/v1/completions \
+#      -H "Content-Type: application/json" \
+#      -d '{
+#        "model": "meta-llama/Meta-Llama-3-70B",
+#        "prompt": "Once upon a time",
+#        "max_tokens": 100
+#      }'
+#
+# This is production-ready multi-node LLM serving with multiple instances!

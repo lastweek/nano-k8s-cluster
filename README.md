@@ -78,11 +78,12 @@ kubectl delete -f examples/12-llm-cluster/serving/disaggregated-serving/
 | [examples/02-config-secrets](examples/02-config-secrets/) | Configuration | ConfigMaps, Secrets |
 | [examples/03-storage](examples/03-storage/) | Storage | PVCs, StorageClasses |
 | [examples/04-stateful-apps](examples/04-stateful-apps/) | Stateful workloads | StatefulSets, distributed systems |
-| [examples/05-health-monitoring](examples/05-health-monitoring/) | Health checks | Probes, monitoring |
-| [examples/06-scaling](examples/06-scaling/) | Scaling | HPA, custom metrics |
-| [examples/07-scheduling](examples/07-scheduling/) | Scheduling | Node selection, taints, affinity |
-| [examples/08-networking](examples/08-networking/) | Advanced networking | Ingress, network policies |
-| [examples/09-multitenancy](examples/09-multitenancy/) | Multi-tenancy | Namespaces, quotas, RBAC |
+| [examples/05-scaling-hpa](examples/05-scaling-hpa/) | Scaling | HPA, custom metrics |
+| [examples/06-crd-operator](examples/06-crd-operator/) | Custom Resources & Operators | CRDs, operators, controllers |
+| [examples/07-user-defined-scheduling](examples/07-user-defined-scheduling/) | User-Defined Scheduling | nodeSelector, affinity, taints/tolerations, priority |
+| [examples/08-custom-scheduler-binary](examples/08-custom-scheduler-binary/) | Custom Scheduler Binary | Write your own scheduler in Go/Python |
+| [examples/09-multi-node-serving](examples/09-multi-node-serving/) | Multi-Node Model Serving | StatefulSets, tensor parallelism, Dynamo-like architecture |
+| [examples/10-llm-serving-crd](examples/10-llm-serving-crd/) | LLM Serving CRD & Operator | Custom resource definition, operator, reconciliation |
 
 ### 🚀 LLM Cluster Examples
 

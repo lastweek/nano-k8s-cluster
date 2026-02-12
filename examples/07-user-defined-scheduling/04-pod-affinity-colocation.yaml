@@ -1,0 +1,396 @@
+# Pod Affinity for Co-location Example
+#
+# This example demonstrates how to use pod affinity to co-locate pods
+# on the same node. This is useful for:
+# - Multi-container model serving (encoder + decoder)
+# - Model server + local cache
+# - Model server + monitoring sidecar
+# - Reducing network latency between related services
+#
+# What you'll learn:
+# - How to use podAffinity for co-location
+# - How to co-locate with specific pods
+# - Hard vs soft affinity requirements
+
+---
+# Example 1: Model server + Redis cache on same node
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-cache
+spec:
+  selector:
+    app: redis-cache
+  ports:
+  - port: 6379
+    targetPort: 6379
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-cache
+  labels:
+    app: redis-cache
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: redis-cache
+  template:
+    metadata:
+      labels:
+        app: redis-cache
+    spec:
+      # No affinity - can go anywhere
+      containers:
+      - name: redis
+        image: redis:7-alpine
+        ports:
+        - name: redis
+          containerPort: 6379
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: model-server-with-cache
+  labels:
+    app: model-server-with-cache
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: model-server-with-cache
+  template:
+    metadata:
+      labels:
+        app: model-server-with-cache
+    spec:
+      # Co-locate with redis-cache pod on SAME node
+      affinity:
+        podAffinity:
+          # HARD requirement - must be on same node
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values:
+                - redis-cache
+            topologyKey: kubernetes.io/hostname
+
+      containers:
+      - name: vllm
+        image: vllm/vllm-openai:latest
+        command: ["python", "-m", "vllm.entrypoints.openai.api_server"]
+        args:
+        - --model=meta-llama/Meta-Llama-3-8B
+        - --host=0.0.0.0
+        - --port=8000
+        env:
+        - name: REDIS_HOST
+          value: "localhost"  # Local cache on same node!
+        ports:
+        - name: http
+          containerPort: 8000
+        resources:
+          requests:
+            cpu: "2"
+            memory: "16Gi"
+          limits:
+            cpu: "4"
+            memory: "32Gi"
+
+---
+# Example 2: Encoder + Decoder on same node (multi-stage model)
+apiVersion: v1
+kind: Service
+metadata:
+  name: encoder-service
+spec:
+  selector:
+    app: encoder
+  ports:
+  - port: 8001
+    targetPort: 8001
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: encoder
+  labels:
+    app: encoder
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: encoder
+  template:
+    metadata:
+      labels:
+        app: encoder
+        component: encoder
+    spec:
+      # No affinity - scheduler places these first
+      nodeSelector:
+        gpu.node: "true"
+      containers:
+      - name: encoder
+        image: vllm/vllm-openai:latest
+        command: ["python", "-m", "vllm.entrypoints.openai.api_server"]
+        args:
+        - --model=meta-llama/Meta-Llama-3-8B
+        - --host=0.0.0.0
+        - --port=8001
+        ports:
+        - name: http
+          containerPort: 8001
+        resources:
+          requests:
+            nvidia.com/gpu: "2"
+          limits:
+            nvidia.com/gpu: "2"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: decoder
+  labels:
+    app: decoder
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: decoder
+  template:
+    metadata:
+      labels:
+        app: decoder
+        component: decoder
+    spec:
+      # Co-locate with encoder on same node
+      affinity:
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values:
+                - encoder
+            topologyKey: kubernetes.io/hostname
+
+      containers:
+      - name: decoder
+        image: vllm/vllm-openai:latest
+        command: ["python", "-m", "vllm.entrypoints.openai.api_server"]
+        args:
+        - --model=meta-llama/Meta-Llama-3-8B
+        - --host=0.0.0.0
+        - --port=8002
+        env:
+        - name: ENCODER_URL
+          value: "http://encoder-service:8001"  # Same node = low latency!
+        ports:
+        - name: http
+          containerPort: 8002
+        resources:
+          requests:
+            nvidia.com/gpu: "2"
+          limits:
+            nvidia.com/gpu: "2"
+
+---
+# Example 3: SOFT affinity - prefer co-location but allow spread
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: model-server-prefer-cache
+  labels:
+    app: model-server-prefer-cache
+spec:
+  replicas: 10
+  selector:
+    matchLabels:
+      app: model-server-prefer-cache
+  template:
+    metadata:
+      labels:
+        app: model-server-prefer-cache
+    spec:
+      # PREFER co-location with cache, but don't require it
+      affinity:
+        podAffinity:
+          # SOFT requirement - prefer same node, but allow other nodes
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100  # Higher weight = stronger preference
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - redis-cache
+              topologyKey: kubernetes.io/hostname
+
+      containers:
+      - name: vllm
+        image: vllm/vllm-openai:latest
+        command: ["sleep", "3600"]
+        resources:
+          requests:
+            cpu: "1"
+            memory: "8Gi"
+
+---
+# Example 4: Co-locate with multiple pod types
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: monitoring-sidecar
+  labels:
+    app: monitoring-sidecar
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: monitoring-sidecar
+  template:
+    metadata:
+      labels:
+        app: monitoring-sidecar
+    spec:
+      containers:
+      - name: prometheus
+        image: prom/prometheus:latest
+        command: ["sleep", "3600"]
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: model-with-monitoring
+  labels:
+    app: model-with-monitoring
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: model-with-monitoring
+  template:
+    metadata:
+      labels:
+        app: model-with-monitoring
+    spec:
+      # Co-locate with monitoring on same node
+      affinity:
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          # Match ANY of these pod types
+          - labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values:
+                - monitoring-sidecar
+                - redis-cache
+            topologyKey: kubernetes.io/hostname
+
+      containers:
+      - name: vllm
+        image: vllm/vllm-openai:latest
+        command: ["sleep", "3600"]
+        resources:
+          requests:
+            nvidia.com/gpu: "1"
+
+---
+# How Pod Affinity Works:
+#
+# ┌─────────────────────────────────────────────────────────────┐
+# │  Without Pod Affinity                                       │
+# │  ┌───────────────────────────────────────────────────────┐ │
+# │  │ Pod A (redis) → Node 1                                │ │
+# │  │ Pod B (model) → Node 2  (Network latency!)           │ │
+# │  └───────────────────────────────────────────────────────┘ │
+# └─────────────────────────────────────────────────────────────┘
+#                           │
+#                           ▼
+# ┌─────────────────────────────────────────────────────────────┐
+# │  With Pod Affinity (co-location)                           │
+# │  ┌───────────────────────────────────────────────────────┐ │
+# │  │ Pod A (redis)  → Node 1                               │ │
+# │  │ Pod B (model)  → Node 1  (Same node = low latency!)  │ │
+# │  └───────────────────────────────────────────────────────┘ │
+# └─────────────────────────────────────────────────────────────┘
+#
+# Affinity Types:
+#
+# ┌─────────────────────────────────────────────────────────────┐
+# │  requiredDuringSchedulingIgnoredDuringExecution            │
+# │  - HARD requirement                                         │
+# │  - Must schedule on same node                              │
+# │  - If impossible, pod stays Pending                        │
+# │  - Use for: Critical co-location requirements             │
+# └─────────────────────────────────────────────────────────────┘
+#
+# ┌─────────────────────────────────────────────────────────────┐
+# │  preferredDuringSchedulingIgnoredDuringExecution           │
+# │  - SOFT requirement                                         │
+# │  - Prefer same node, but allow others                      │
+# │  - Higher weight = stronger preference (1-100)             │
+# │  - Use for: Performance optimization, not requirements     │
+# └─────────────────────────────────────────────────────────────┘
+#
+# Common Use Cases:
+#
+# 1. Model Server + Cache
+#    - Cache on same node = lower latency
+#    - Local network = no cross-node traffic
+#
+# 2. Encoder + Decoder
+#    - Multi-stage models
+#    - Shared memory access
+#    - Lower inter-stage latency
+#
+# 3. Application + Monitoring
+#    - Local metrics collection
+#    - No cross-node monitoring traffic
+#
+# 4. Application + Log Sidecar
+#    - Log shipping on same node
+#    - No network latency for logs
+#
+# Testing:
+#
+# 1. Deploy the base pods first (redis, encoder, monitoring):
+#    kubectl apply -f 04-pod-affinity-colocation.yaml
+#
+# 2. Check where pods are scheduled:
+#    kubectl get pods -o wide
+#
+# 3. Verify co-location:
+#    kubectl get pods -o wide -l app=model-server-with-cache
+#    kubectl get pods -o wide -l app=redis-cache
+#    # They should be on the same nodes!
+#
+# 4. Check node by node:
+#    kubectl get pods -o wide --sort-by=.spec.nodeName
+#
+# 5. Test soft affinity:
+#    # Scale up to see if some pods go to different nodes
+#    kubectl scale deployment model-server-prefer-cache --replicas=20

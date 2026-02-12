@@ -1,0 +1,844 @@
+# 08: Complete Production Cluster
+#
+# This example brings everything together into a production-ready
+# multi-node LLM serving cluster with multiple model instances.
+#
+# Components included:
+# - Multi-node StatefulSets (each = one model instance with TP)
+# - Request queue (Redis)
+# - Router layer with HPA (balances ACROSS instances)
+# - Distributed coordination (within each instance)
+# - Monitoring stack (Prometheus, Grafana)
+# - Logging (Loki)
+# - Network policies
+# - PodDisruptionBudgets
+#
+# This is the culmination of all previous examples!
+
+---
+# ============================================
+# MONITORING STACK
+# ============================================
+
+# Prometheus
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+      scrape_timeout: 10s
+    scrape_configs:
+    - job_name: 'llama-serving'
+      kubernetes_sd_configs:
+      - role: pod
+        namespaces:
+          names:
+          - default
+      relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_label_app]
+        regex: llama-70b
+        action: keep
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: pod
+    - job_name: 'nvidia-dcgm'
+      static_configs:
+      - targets: ['dcgm-exporter:9400']
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+    spec:
+      containers:
+      - name: prometheus
+        image: prom/prometheus:latest
+        args:
+        - --config.file=/etc/prometheus/prometheus.yml
+        - --storage.tsdb.path=/prometheus
+        - --web.enable-lifecycle
+        ports:
+        - name: prometheus
+          containerPort: 9090
+        volumeMounts:
+        - name: config
+          mountPath: /etc/prometheus
+        - name: storage
+          mountPath: /prometheus
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "1Gi"
+          limits:
+            cpu: "1000m"
+            memory: "2Gi"
+      volumes:
+      - name: config
+        configMap:
+          name: prometheus-config
+      - name: storage
+        emptyDir:
+          sizeLimit: 10Gi
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+spec:
+  ports:
+  - port: 9090
+  selector:
+    app: prometheus
+
+---
+# Grafana
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-datasources
+data:
+  prometheus.yaml: |
+    apiVersion: 1
+    datasources:
+    - name: Prometheus
+      type: prometheus
+      access: proxy
+      url: http://prometheus:9090
+      isDefault: true
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: grafana
+  template:
+    metadata:
+      labels:
+        app: grafana
+    spec:
+      containers:
+      - name: grafana
+        image: grafana/grafana:latest
+        ports:
+        - name: grafana
+          containerPort: 3000
+        env:
+        - name: GF_SECURITY_ADMIN_PASSWORD
+          value: "admin"
+        - name: GF_USERS_ALLOW_SIGN_UP
+          value: "false"
+        volumeMounts:
+        - name: datasources
+          mountPath: /etc/grafana/provisioning/datasources
+        - name: storage
+          mountPath: /var/lib/grafana
+        resources:
+          requests:
+            cpu: "200m"
+            memory: "256Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+      volumes:
+      - name: datasources
+        configMap:
+          name: grafana-datasources
+      - name: storage
+        emptyDir:
+          sizeLimit: 1Gi
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+spec:
+  ports:
+  - port: 3000
+  selector:
+    app: grafana
+
+---
+# ============================================
+# REQUEST QUEUE
+# ============================================
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llama-queue
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: llama-queue
+  template:
+    metadata:
+      labels:
+        app: llama-queue
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - llama-queue
+              topologyKey: kubernetes.io/hostname
+      containers:
+      - name: redis
+        image: redis:7-alpine
+        command: ["redis-server"]
+        args:
+        - --maxmemory
+        - "2gb"
+        - --maxmemory-policy
+        - "allkeys-lru"
+        ports:
+        - name: redis
+          containerPort: 6379
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "2Gi"
+          limits:
+            cpu: "2000m"
+            memory: "4Gi"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: llama-queue
+spec:
+  clusterIP: None
+  ports:
+  - port: 6379
+  selector:
+    app: llama-queue
+
+---
+# ============================================
+# MODEL INSTANCE A
+# ============================================
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: llama-70b-instance-a-backend
+spec:
+  clusterIP: None
+  ports:
+  - name: http
+    port: 8000
+  - name: p2p
+    port: 5000
+  selector:
+    app: llama-70b
+    instance: a
+    component: backend
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: llama-70b-instance-a
+spec:
+  serviceName: llama-70b-instance-a-backend
+  replicas: 2
+  podManagementPolicy: OrderedReady
+  selector:
+    matchLabels:
+      app: llama-70b
+      instance: a
+      component: backend
+  template:
+    metadata:
+      labels:
+        app: llama-70b
+        instance: a
+        component: backend
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values:
+                - llama-70b
+              - key: instance
+                operator: In
+                values:
+                - a
+              - key: component
+                operator: In
+                values:
+                - backend
+            topologyKey: kubernetes.io/hostname
+      nodeSelector:
+        gpu.node: "true"
+      terminationGracePeriodSeconds: 600
+      containers:
+      - name: vllm
+        image: vllm/vllm-openai:latest
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          POD_ORDINAL=$(echo $HOSTNAME | cut -d- -f3)
+          echo "Pod ordinal: $POD_ORDINAL"
+          export POD_ORDINAL
+          exec python -m vllm.entrypoints.openai.api_server \
+            --model=meta-llama/Meta-Llama-3-70B \
+            --tensor-parallel-size=8 \
+            --host=0.0.0.0 \
+            --port=8000
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: MASTER_ADDR
+          value: "llama-70b-instance-a-0.llama-70b-instance-a-backend.default.svc.cluster.local"
+        - name: MASTER_PORT
+          value: "5000"
+        - name: CUDA_VISIBLE_DEVICES
+          value: "0,1,2,3"
+        lifecycle:
+          preStop:
+            exec:
+              command:
+              - sh
+              - -c
+              - "sleep 30"
+        ports:
+        - name: http
+          containerPort: 8000
+        - name: p2p
+          containerPort: 5000
+        volumeMounts:
+        - name: shm
+          mountPath: /dev/shm
+        resources:
+          requests:
+            nvidia.com/gpu: "4"
+            cpu: "16"
+            memory: "64Gi"
+          limits:
+            nvidia.com/gpu: "4"
+            memory: "128Gi"
+        startupProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 120
+          periodSeconds: 10
+          failureThreshold: 60
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 5
+          failureThreshold: 3
+      volumes:
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 16Gi
+
+---
+# PodDisruptionBudget for Instance A
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: llama-70b-instance-a-pdb
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: llama-70b
+      instance: a
+      component: backend
+
+---
+# Service to expose Instance A (rank-0)
+apiVersion: v1
+kind: Service
+metadata:
+  name: llama-70b-instance-a
+spec:
+  type: ClusterIP
+  ports:
+  - port: 8000
+    targetPort: 8000
+  selector:
+    app: llama-70b
+    instance: a
+    component: backend
+
+---
+# ============================================
+# MODEL INSTANCE B
+# ============================================
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: llama-70b-instance-b-backend
+spec:
+  clusterIP: None
+  ports:
+  - name: http
+    port: 8000
+  - name: p2p
+    port: 5000
+  selector:
+    app: llama-70b
+    instance: b
+    component: backend
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: llama-70b-instance-b
+spec:
+  serviceName: llama-70b-instance-b-backend
+  replicas: 2
+  podManagementPolicy: OrderedReady
+  selector:
+    matchLabels:
+      app: llama-70b
+      instance: b
+      component: backend
+  template:
+    metadata:
+      labels:
+        app: llama-70b
+        instance: b
+        component: backend
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values:
+                - llama-70b
+              - key: instance
+                operator: In
+                values:
+                - b
+              - key: component
+                operator: In
+                values:
+                - backend
+            topologyKey: kubernetes.io/hostname
+      nodeSelector:
+        gpu.node: "true"
+      terminationGracePeriodSeconds: 600
+      containers:
+      - name: vllm
+        image: vllm/vllm-openai:latest
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          POD_ORDINAL=$(echo $HOSTNAME | cut -d- -f3)
+          echo "Pod ordinal: $POD_ORDINAL"
+          export POD_ORDINAL
+          exec python -m vllm.entrypoints.openai.api_server \
+            --model=meta-llama/Meta-Llama-3-70B \
+            --tensor-parallel-size=8 \
+            --host=0.0.0.0 \
+            --port=8000
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: MASTER_ADDR
+          value: "llama-70b-instance-b-0.llama-70b-instance-b-backend.default.svc.cluster.local"
+        - name: MASTER_PORT
+          value: "5000"
+        - name: CUDA_VISIBLE_DEVICES
+          value: "0,1,2,3"
+        lifecycle:
+          preStop:
+            exec:
+              command:
+              - sh
+              - -c
+              - "sleep 30"
+        ports:
+        - name: http
+          containerPort: 8000
+        - name: p2p
+          containerPort: 5000
+        volumeMounts:
+        - name: shm
+          mountPath: /dev/shm
+        resources:
+          requests:
+            nvidia.com/gpu: "4"
+            cpu: "16"
+            memory: "64Gi"
+          limits:
+            nvidia.com/gpu: "4"
+            memory: "128Gi"
+        startupProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 120
+          periodSeconds: 10
+          failureThreshold: 60
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 5
+          failureThreshold: 3
+      volumes:
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 16Gi
+
+---
+# PodDisruptionBudget for Instance B
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: llama-70b-instance-b-pdb
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: llama-70b
+      instance: b
+      component: backend
+
+---
+# Service to expose Instance B (rank-0)
+apiVersion: v1
+kind: Service
+metadata:
+  name: llama-70b-instance-b
+spec:
+  type: ClusterIP
+  ports:
+  - port: 8000
+    targetPort: 8000
+  selector:
+    app: llama-70b
+    instance: b
+    component: backend
+
+---
+# ============================================
+# ROUTER LAYER
+# ============================================
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: router-config
+data:
+  nginx.conf: |
+    worker_processes auto;
+
+    upstream llama_backend {
+        # Load balance ACROSS MODEL INSTANCES
+        # Each service points to rank-0 of a different model instance
+        least_conn;
+        server llama-70b-instance-a:8000 max_fails=2 fail_timeout=30s;
+        server llama-70b-instance-b:8000 max_fails=2 fail_timeout=30s;
+        keepalive 32;
+        keepalive_timeout 300s;
+    }
+
+    server {
+        listen 8080;
+        server_name _;
+
+        location /health {
+            return 200 "OK\n";
+            access_log off;
+        }
+
+        location / {
+            proxy_pass http://llama_backend;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_connect_timeout 300s;
+            proxy_send_timeout 300s;
+            proxy_read_timeout 300s;
+            proxy_buffering off;
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+        }
+    }
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llama-router
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: llama-router
+      component: router
+  template:
+    metadata:
+      labels:
+        app: llama-router
+        component: router
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - llama-router
+              topologyKey: kubernetes.io/hostname
+      containers:
+      - name: router
+        image: nginx:alpine
+        ports:
+        - name: http
+          containerPort: 8080
+        volumeMounts:
+        - name: config
+          mountPath: /etc/nginx/conf.d
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "512Mi"
+          limits:
+            cpu: "2000m"
+            memory: "2Gi"
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+      volumes:
+      - name: config
+        configMap:
+          name: router-config
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: llama-70b
+spec:
+  type: LoadBalancer
+  ports:
+  - port: 8000
+    targetPort: 8080
+  selector:
+    app: llama-router
+    component: router
+
+---
+# ============================================
+# AUTOSCALING (Router only)
+# ============================================
+
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: llama-router-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: llama-router
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+
+---
+# ============================================
+# NETWORK POLICY (Security)
+# ============================================
+
+# Allow only router to talk to backend
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: llama-backend-policy
+  labels:
+    app: llama-70b
+spec:
+  podSelector:
+    matchLabels:
+      app: llama-70b
+      component: backend
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: llama-router
+          component: router
+    ports:
+    - protocol: TCP
+      port: 8000
+
+---
+# Complete Production Architecture:
+#
+# ┌─────────────────────────────────────────────────────────────────┐
+# │  Production Multi-Instance LLM Serving Cluster                    │
+# │  ┌───────────────────────────────────────────────────────────┐  │
+# │  │                                                          │  │
+# │  │  External Client → LoadBalancer/Ingress                   │  │
+# │  │       ↓                                                  │  │
+# │  │  ┌─────────────────────────────────────────────────────┐ │  │
+# │  │  │ Router Layer (HPA: 2-10 replicas for HA)           │ │  │
+# │  │  │ - Load balancing ACROSS INSTANCES                   │ │  │
+# │  │  │ - Circuit breaking                                   │ │  │
+# │  │  │ - Connection pooling                                 │ │  │
+# │  │  └─────────────────────────────────────────────────────┘ │  │
+# │  │       ↓                                                  │  │
+# │  │  ┌─────────────────────┐  ┌─────────────────────────────┐│  │
+# │  │  │ Instance A           │  │ Instance B                 ││  │
+# │  │  │ StatefulSet (2 pods) │  │ StatefulSet (2 pods)       ││  │
+# │  │  │ ┌─────────────────┐ │  │ ┌─────────────────────────┐ ││  │
+# │  │  │ │Pod-A0 (rank 0)  │ │  │ │Pod-B0 (rank 0)          │ ││  │
+# │  │  │ │4x H100 GPU      │ │  │ │4x H100 GPU              │ ││  │
+# │  │  │ │Coordinator      │ │  │ │Coordinator              │ ││  │
+# │  │  │ │NVLink TP=8      │ │  │ │NVLink TP=8              │ ││  │
+# │  │  │ └─────────────────┘ │  │ └─────────────────────────┘ ││  │
+# │  │  │ ┌─────────────────┐ │  │ ┌─────────────────────────┐ ││  │
+# │  │  │ │Pod-A1 (rank 1)  │ │  │ │Pod-B1 (rank 1)          │ ││  │
+# │  │  │ │4x H100 GPU      │ │  │ │4x H100 GPU              │ ││  │
+# │  │  │ │Worker (TP)      │ │  │ │Worker (TP)              │ ││  │
+# │  │  │ └─────────────────┘ │  │ └─────────────────────────┘ ││  │
+# │  │  │       │              │  │              │              ││  │
+# │  │  │    TP=8 (2×4 GPUs) │  │    TP=8 (2×4 GPUs)         ││  │
+# │  │  └─────────────────────┘  └─────────────────────────────┘│  │
+# │  │       ↓                              ↓                   │  │
+# │  │  Router balances: instance-a ↔ instance-b                │  │
+# │  │                                                          │  │
+# │  │  Total: 2 model instances, 4 pods, 16 GPUs               │  │
+# │  │                                                          │  │
+# │  │  Monitoring Sidecar:                                    │  │
+# │  │  ┌─────────────────────────────────────────────────────┐ │  │
+# │  │  │ Prometheus → Scrap metrics from all pods           │ │  │
+# │  │  │ Grafana → Dashboards for observability              │ │  │
+# │  │  │ DCGM Exporter → GPU utilization per GPU              │ │  │
+# │  │  └─────────────────────────────────────────────────────┘ │  │
+# │  │                                                          │  │
+# │  └───────────────────────────────────────────────────────────┘  │
+# └─────────────────────────────────────────────────────────────────┘
+#
+# Key Architecture Points:
+#
+# 1. Each StatefulSet = ONE model instance
+#    - Instance A: llama-70b-instance-a (2 pods, TP=8)
+#    - Instance B: llama-70b-instance-b (2 pods, TP=8)
+#
+# 2. Router balances ACROSS INSTANCES:
+#    - llama-70b-instance-a → rank-0 of Instance A
+#    - llama-70b-instance-b → rank-0 of Instance B
+#
+# 3. To scale (add more capacity):
+#    - Create Instance C, D, E... (new StatefulSets)
+#    - Update router upstream to include new instances
+#    - NOT by adding replicas to existing StatefulSets!
+#
+# 4. High Availability:
+#    - Router HPA (2-10 replicas)
+#    - PodDisruptionBudget for each instance
+#    - Network policies for security
+#    - Graceful shutdown with preStop hooks
+#
+# Deployment:
+#
+# 1. Apply all components:
+#    kubectl apply -f 08-complete-cluster.yaml
+#
+# 2. Verify all pods are running:
+#    kubectl get pods -A
+#
+# 3. Check services:
+#    kubectl get svc
+#
+# 4. Access Grafana:
+#    kubectl port-forward svc/grafana 3000:3000
+#    # Open http://localhost:3000
+#    # Login: admin / admin
+#
+# 5. Check Prometheus:
+#    kubectl port-forward svc/prometheus 9090:9090
+#    # Open http://localhost:9090
+#
+# 6. Test the full stack:
+#    kubectl port-forward svc/llama-70b 8000:8000
+#
+#    # Send inference request
+#    curl http://localhost:8000/v1/completions \
+#      -H "Content-Type: application/json" \
+#      -d '{
+#        "model": "meta-llama/Meta-Llama-3-70B",
+#        "prompt": "Explain Kubernetes in one sentence",
+#        "max_tokens": 50
+#      }'
+#
+# This is production-ready multi-node LLM serving with multiple instances!
+# Similar to what NVIDIA Dynamo uses in production.

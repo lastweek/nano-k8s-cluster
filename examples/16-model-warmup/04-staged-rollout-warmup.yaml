@@ -1,0 +1,184 @@
+# Strategy 3: Staged Rollout with CronJob
+#
+# This strategy uses a CronJob to pre-scale deployments before
+# peak traffic periods, allowing pods to warm up gradually.
+#
+# Use case: Predictable traffic patterns (e.g., business hours)
+# Benefit: No cold starts during peak traffic
+# Trade-off: Running extra pods during low-traffic periods
+
+---
+# Main deployment with readiness probe warm-up
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-staged
+  labels:
+    app: vllm
+    warmup: "staged"
+spec:
+  replicas: 2  # Minimum replicas during off-peak
+  selector:
+    matchLabels:
+      app: vllm
+      warmup: "staged"
+  template:
+    metadata:
+      labels:
+        app: vllm
+        warmup: "staged"
+    spec:
+      containers:
+      - name: vllm
+        image: vllm-warmup-test:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8000
+          name: http
+        env:
+        - name: MODEL_NAME
+          value: "meta-llama/Llama-3-70B"
+        - name: MODEL_LOADING_TIME
+          value: "30"
+        - name: WARMUP_REQUEST_TIME
+          value: "1"
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8000
+          initialDelaySeconds: 5
+          periodSeconds: 3
+          failureThreshold: 20
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 15
+          periodSeconds: 10
+          failureThreshold: 3
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "2Gi"
+          limits:
+            cpu: "2"
+            memory: "4Gi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-staged
+spec:
+  selector:
+    app: vllm
+    warmup: "staged"
+  ports:
+  - port: 80
+    targetPort: 8000
+  type: ClusterIP
+---
+# CronJob to scale up before peak traffic
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: morning-scale-up
+spec:
+  schedule: "55 7 * * 1-5"  # 7:55 AM, Monday-Friday
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: scaler
+          restartPolicy: OnFailure
+          containers:
+          - name: scaler
+            image: bitnami/kubectl:latest
+            command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+
+              echo "[$(date)] Scaling up for morning peak traffic..."
+
+              # Scale up 30 minutes before peak traffic
+              kubectl scale deployment/vllm-staged --replicas=10
+
+              # Wait for all pods to be ready (with model loaded)
+              echo "[$(date)] Waiting for pods to become ready..."
+              kubectl wait --for=condition=available deployment/vllm-staged --timeout=600s
+
+              # Verify all pods are ready
+              READY=$(kubectl get deployment/vllm-staged -o jsonpath='{.status.readyReplicas}')
+              echo "[$(date)] Scale-up complete! Ready replicas: $READY"
+
+              # Log metrics
+              echo "[$(date)] Pod status:"
+              kubectl get pods -l app=vllm,warmup=staged
+---
+# CronJob to scale down after peak traffic
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: evening-scale-down
+spec:
+  schedule: "0 19 * * 1-5"  # 7:00 PM, Monday-Friday
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: scaler
+          restartPolicy: OnFailure
+          containers:
+          - name: scaler
+            image: bitnami/kubectl:latest
+            command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+
+              echo "[$(date)] Scaling down after peak traffic..."
+
+              # Scale down to minimum
+              kubectl scale deployment/vllm-staged --replicas=2
+
+              echo "[$(date)] Scale-down complete!"
+---
+# ServiceAccount for the scaler CronJobs
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: scaler
+---
+# RBAC: Role for scaling deployments
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: deployment-scaler
+  namespace: default
+rules:
+- apiGroups: ["apps"]
+  resources: ["deployments", "deployments/scale"]
+  verbs: ["get", "list", "watch", "patch", "update", "scale"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+---
+# RBAC: RoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: deployment-scaler
+  namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: deployment-scaler
+subjects:
+- kind: ServiceAccount
+  name: scaler

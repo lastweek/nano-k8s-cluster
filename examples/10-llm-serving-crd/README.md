@@ -28,8 +28,6 @@ The previous layout mixed CRDs, operators, examples, and deep docs in one number
 ├── 08-disaggregated-prefill-decode.yaml
 ├── 09-DEPLOYMENT-ARCHITECTURE.md
 ├── 10-disaggregated-autoscaler.yaml
-├── 11-ARCHITECTURE-DIAGRAMS.md
-├── PRODUCTION-AUTOSCALING-DESIGN.md
 ├── controller/
 ├── operator-autoscaler.go
 └── Dockerfile.autoscaler
@@ -65,9 +63,11 @@ kubectl apply -f 10-disaggregated-autoscaler.yaml
 
 Treat each `LLMCluster` as a fixed-shape TP instance. Scale capacity by adding/removing whole `LLMCluster` objects, not by mutating TP backend pod counts.
 
-## Docs
+## Documentation
+## Documentation
 
-- Learning path: `00-LEARNING-PATH.md`
-- System architecture: `09-DEPLOYMENT-ARCHITECTURE.md`
-- Production autoscaling design: `PRODUCTION-AUTOSCALING-DESIGN.md`
-- Mermaid diagrams: `11-ARCHITECTURE-DIAGRAMS.md`
+### Learning Path
+- [`00-LEARNING-PATH.md`](00-LEARNING-PATH.md) - Progressive learning guide
+
+### Architecture & Design
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) - Complete system architecture with design rationale, trade-offs, Mermaid diagrams, operational considerations, and performance characteristics

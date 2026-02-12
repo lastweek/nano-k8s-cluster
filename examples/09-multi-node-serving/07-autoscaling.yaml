@@ -1,0 +1,640 @@
+# 07: Autoscaling for Multi-Node Serving
+#
+# This example shows how autoscaling works with multi-node LLM serving.
+# KEY INSIGHT: You cannot use HPA to scale StatefulSet replicas for TP models!
+#
+# What you'll learn:
+# - Why HPA doesn't work for StatefulSets with tensor parallelism
+# - Router autoscaling (valid - Deployment can be scaled)
+# - How to scale backend instances (manual: create new StatefulSets)
+# - Connection draining during scale-down
+
+---
+# ============================================
+# Important: Why HPA Doesn't Work for Backend
+# ============================================
+#
+# ┌─────────────────────────────────────────────────────────────┐
+# │  Wrong: Using HPA to Scale StatefulSet Replicas              │
+# │  ┌───────────────────────────────────────────────────────┐  │
+# │  │ Initial: 2 pods, TP=8 (2×4 GPUs)                      │  │
+# │  │                                                         │  │
+# │  │ HPA triggers scale-up: 2 → 4 replicas                  │  │
+# │  │                                                         │  │
+# │  │ Problem: TP was configured for 2 pods (TP=8)           │  │
+# │  │          Now 4 pods exist!                             │  │
+# │  │          TP must be recalculated to TP=16              │  │
+# │  │          Model restart required!                       │  │
+# │  │                                                         │  │
+# │  │ Result: Downtime, broken TP configuration             │  │
+# │  └───────────────────────────────────────────────────────┘  │
+# └─────────────────────────────────────────────────────────────┘
+#
+# ┌─────────────────────────────────────────────────────────────┐
+# │  Correct: Scale by Creating New StatefulSets                │
+# │  ┌───────────────────────────────────────────────────────┐  │
+# │  │ Instance A: TP=8 (running)                             │  │
+# │  │ Instance B: TP=8 (running)                             │  │
+# │  │                                                         │  │
+# │  │ To scale: Create Instance C (TP=8)                     │  │
+# │  │         Update router to include instance C            │  │
+# │  │                                                         │  │
+# │  │ Result: Zero-downtime scaling                          │  │
+# │  └───────────────────────────────────────────────────────┘  │
+# └─────────────────────────────────────────────────────────────┘
+
+---
+# ============================================
+# MODEL INSTANCE A
+# ============================================
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: llama-70b-instance-a-backend
+  labels:
+    app: llama-70b
+    instance: a
+    component: backend
+spec:
+  clusterIP: None
+  ports:
+  - name: http
+    port: 8000
+  - name: p2p
+    port: 5000
+  selector:
+    app: llama-70b
+    instance: a
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: llama-70b-instance-a
+  labels:
+    app: llama-70b
+    instance: a
+    component: backend
+spec:
+  serviceName: llama-70b-instance-a-backend
+  replicas: 2  # Fixed: TP configured for 2 pods
+  podManagementPolicy: OrderedReady
+  selector:
+    matchLabels:
+      app: llama-70b
+      instance: a
+  template:
+    metadata:
+      labels:
+        app: llama-70b
+        instance: a
+        component: backend
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values:
+                - llama-70b
+              - key: instance
+                operator: In
+                values:
+                - a
+            topologyKey: kubernetes.io/hostname
+      nodeSelector:
+        gpu.node: "true"
+      terminationGracePeriodSeconds: 600  # 10 minutes to drain connections
+      containers:
+      - name: vllm
+        image: vllm/vllm-openai:latest
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          POD_ORDINAL=$(echo $HOSTNAME | cut -d- -f3)
+          echo "Pod ordinal: $POD_ORDINAL"
+          export POD_ORDINAL
+          exec python -m vllm.entrypoints.openai.api_server \
+            --model=meta-llama/Meta-Llama-3-70B \
+            --tensor-parallel-size=8 \
+            --host=0.0.0.0 \
+            --port=8000
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: MASTER_ADDR
+          value: "llama-70b-instance-a-0.llama-70b-instance-a-backend.default.svc.cluster.local"
+        - name: MASTER_PORT
+          value: "5000"
+        - name: CUDA_VISIBLE_DEVICES
+          value: "0,1,2,3"
+        ports:
+        - name: http
+          containerPort: 8000
+        - name: p2p
+          containerPort: 5000
+        lifecycle:
+          # Pre-stop hook for graceful shutdown
+          preStop:
+            exec:
+              command:
+              - sh
+              - -c
+              - |
+                echo "Draining connections..."
+                sleep 30  # Give time for in-flight requests
+                echo "Drained, ready to shutdown"
+        volumeMounts:
+        - name: shm
+          mountPath: /dev/shm
+        resources:
+          requests:
+            nvidia.com/gpu: "4"
+            cpu: "16"
+            memory: "64Gi"
+          limits:
+            nvidia.com/gpu: "4"
+            memory: "128Gi"
+        startupProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 120
+          periodSeconds: 10
+          failureThreshold: 60
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 60
+          periodSeconds: 10
+      volumes:
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 16Gi
+
+---
+# Service to expose Instance A (rank-0)
+apiVersion: v1
+kind: Service
+metadata:
+  name: llama-70b-instance-a
+  labels:
+    app: llama-70b
+    instance: a
+    component: backend
+spec:
+  type: ClusterIP
+  ports:
+  - name: http
+    port: 8000
+    targetPort: 8000
+  selector:
+    app: llama-70b
+    instance: a
+    component: backend
+
+---
+# ============================================
+# MODEL INSTANCE B
+# ============================================
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: llama-70b-instance-b-backend
+  labels:
+    app: llama-70b
+    instance: b
+    component: backend
+spec:
+  clusterIP: None
+  ports:
+  - name: http
+    port: 8000
+  - name: p2p
+    port: 5000
+  selector:
+    app: llama-70b
+    instance: b
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: llama-70b-instance-b
+  labels:
+    app: llama-70b
+    instance: b
+    component: backend
+spec:
+  serviceName: llama-70b-instance-b-backend
+  replicas: 2  # Fixed: TP configured for 2 pods
+  podManagementPolicy: OrderedReady
+  selector:
+    matchLabels:
+      app: llama-70b
+      instance: b
+  template:
+    metadata:
+      labels:
+        app: llama-70b
+        instance: b
+        component: backend
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values:
+                - llama-70b
+              - key: instance
+                operator: In
+                values:
+                - b
+            topologyKey: kubernetes.io/hostname
+      nodeSelector:
+        gpu.node: "true"
+      terminationGracePeriodSeconds: 600
+      containers:
+      - name: vllm
+        image: vllm/vllm-openai:latest
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          POD_ORDINAL=$(echo $HOSTNAME | cut -d- -f3)
+          echo "Pod ordinal: $POD_ORDINAL"
+          export POD_ORDINAL
+          exec python -m vllm.entrypoints.openai.api_server \
+            --model=meta-llama/Meta-Llama-3-70B \
+            --tensor-parallel-size=8 \
+            --host=0.0.0.0 \
+            --port=8000
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: MASTER_ADDR
+          value: "llama-70b-instance-b-0.llama-70b-instance-b-backend.default.svc.cluster.local"
+        - name: MASTER_PORT
+          value: "5000"
+        - name: CUDA_VISIBLE_DEVICES
+          value: "0,1,2,3"
+        ports:
+        - name: http
+          containerPort: 8000
+        - name: p2p
+          containerPort: 5000
+        lifecycle:
+          preStop:
+            exec:
+              command:
+              - sh
+              - -c
+              - "sleep 30"
+        volumeMounts:
+        - name: shm
+          mountPath: /dev/shm
+        resources:
+          requests:
+            nvidia.com/gpu: "4"
+            cpu: "16"
+            memory: "64Gi"
+          limits:
+            nvidia.com/gpu: "4"
+            memory: "128Gi"
+        startupProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 120
+          periodSeconds: 10
+          failureThreshold: 60
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 60
+          periodSeconds: 10
+      volumes:
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 16Gi
+
+---
+# Service to expose Instance B (rank-0)
+apiVersion: v1
+kind: Service
+metadata:
+  name: llama-70b-instance-b
+  labels:
+    app: llama-70b
+    instance: b
+    component: backend
+spec:
+  type: ClusterIP
+  ports:
+  - name: http
+    port: 8000
+    targetPort: 8000
+  selector:
+    app: llama-70b
+    instance: b
+    component: backend
+
+---
+# ============================================
+# ROUTER LAYER (with HPA)
+# ============================================
+# Router CAN be autoscaled - it's a Deployment!
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: router-config
+data:
+  nginx.conf: |
+    upstream llama_backend {
+        # Load balance ACROSS MODEL INSTANCES
+        least_conn;
+        server llama-70b-instance-a:8000 max_fails=2 fail_timeout=30s;
+        server llama-70b-instance-b:8000 max_fails=2 fail_timeout=30s;
+        keepalive 32;
+        keepalive_timeout 300s;
+    }
+
+    server {
+        listen 8080;
+        server_name _;
+
+        location /health {
+            return 200 "OK\n";
+            access_log off;
+        }
+
+        location / {
+            proxy_pass http://llama_backend;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_connect_timeout 300s;
+            proxy_send_timeout 300s;
+            proxy_read_timeout 300s;
+            proxy_buffering off;
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+        }
+    }
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llama-router
+  labels:
+    app: llama-70b
+    component: router
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: llama-70b
+      component: router
+  template:
+    metadata:
+      labels:
+        app: llama-70b
+        component: router
+    spec:
+      containers:
+      - name: router
+        image: nginx:alpine
+        ports:
+        - name: http
+          containerPort: 8080
+        volumeMounts:
+        - name: config
+          mountPath: /etc/nginx/conf.d
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "512Mi"
+          limits:
+            cpu: "2000m"
+            memory: "2Gi"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+      volumes:
+      - name: config
+        configMap:
+          name: router-config
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: llama-70b-router
+  labels:
+    app: llama-70b
+    component: router
+spec:
+  type: ClusterIP
+  ports:
+  - name: http
+    port: 8000
+    targetPort: 8080
+  selector:
+    app: llama-70b
+    component: router
+
+---
+# ============================================
+# HPA for Router (Valid - Deployment can scale)
+# ============================================
+
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: llama-router-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: llama-router
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+    scaleUp:
+      stabilizationWindowSeconds: 0
+
+---
+# Scaling Strategies:
+#
+# ┌─────────────────────────────────────────────────────────────┐
+# │  Router Scaling (HPA - Valid)                                │
+# │  ┌───────────────────────────────────────────────────────┐  │
+# │  │ Trigger: CPU > 70%                                     │  │
+# │  │                                                         │  │
+# │  │ Decision: Add 1-2 router pods                          │  │
+# │  │                                                         │  │
+# │  │ Process:                                               │  │
+# │  │ 1. HPA scales router Deployment: 2 → 4 replicas       │  │
+# │  │ 2. New router pods start                               │  │
+# │  │ 3. All router pods balance traffic to instances        │  │
+# │  │ 4. No downtime, smooth scaling                         │  │
+# │  │                                                         │  │
+# │  │ Downtime: Zero!                                        │  │
+# │  └───────────────────────────────────────────────────────┘  │
+# └─────────────────────────────────────────────────────────────┘
+#
+# ┌─────────────────────────────────────────────────────────────┐
+# │  Backend Instance Scaling (Manual - Not HPA)                 │
+# │  ┌───────────────────────────────────────────────────────┐  │
+# │  │ Trigger: Queue length > threshold, manual decision    │  │
+# │  │                                                         │  │
+# │  │ Decision: Create Instance C                            │  │
+# │  │                                                         │  │
+# │  │ Process:                                               │  │
+# │  │ 1. Create llama-70b-instance-c StatefulSet            │  │
+# │  │ 2. Wait for Instance C pods to be ready                │  │
+# │  │ 3. Update router config to add instance C              │  │
+# │  │ 4. Reload router config                                │  │
+# │  │ 5. Router now balances across A, B, C                  │  │
+# │  │                                                         │  │
+# │  │ Downtime: Zero! Existing instances unaffected          │  │
+# │  └───────────────────────────────────────────────────────┘  │
+# └─────────────────────────────────────────────────────────────┘
+#
+# How to Scale Backend Instances:
+#
+# #!/bin/bash
+# # Script to add a new instance
+#
+# INSTANCE_LETTER="c"  # Next instance letter
+# INSTANCE_NAME="llama-70b-instance-${INSTANCE_LETTER}"
+#
+# # 1. Create new instance (copy existing StatefulSet YAML)
+# sed "s/instance-b/instance-${INSTANCE_LETTER}/g" 07-autoscaling.yaml | \
+#   kubectl apply -f -
+#
+# # 2. Wait for pods to be ready
+# kubectl wait --for=condition=ready pod \
+#   -l app=llama-70b,instance=${INSTANCE_LETTER} \
+#   --timeout=600s
+#
+# # 3. Update router config
+# kubectl create configmap router-config --from-file=nginx.conf=router-config-with-c.conf \
+#   --dry-run=client -o yaml | kubectl apply -f -
+#
+# # 4. Reload router pods to pick up new config
+# kubectl rollout restart deployment/llama-router
+#
+# echo "Instance ${INSTANCE_LETTER} added successfully!"
+#
+# Scaling Challenges with TP:
+#
+# ┌─────────────────────────────────────────────────────────────┐
+# │  Challenge 1: TP Size Fixed per Instance                      │
+# │  ┌───────────────────────────────────────────────────────┐  │
+# │  │ Each instance: 2 pods × 4 GPUs = TP size 8             │  │
+# │  │                                                         │  │
+# │  │ Cannot add pods to existing instance (TP would break)  │  │
+# │  │ Must create new instance with same TP configuration    │  │
+# │  └───────────────────────────────────────────────────────┘  │
+# │                                                                │
+# │  Challenge 2: Router Config Updates                           │
+# │  ┌───────────────────────────────────────────────────────┐  │
+# │  │ Adding new instance requires:                          │  │
+# │  │ 1. Creating StatefulSet                                │  │
+# │  │ 2. Updating router upstream config                    │  │
+# │  │ 3. Reloading router                                    │  │
+# │  │                                                         │  │
+# │  │ Could be automated with an operator!                   │  │
+# │  └───────────────────────────────────────────────────────┘  │
+# │                                                                │
+# │  Challenge 3: Connection Migration                            │
+# │  ┌───────────────────────────────────────────────────────┐  │
+# │  │ Removing instance requires:                            │  │
+# │  │ 1. Drain existing connections                          │  │
+# │  │ 2. Remove from router config                            │  │
+# │  │ 3. Delete StatefulSet                                   │  │
+# │  │                                                         │  │
+# │  │ PreStop hook gives time for in-flight requests         │  │
+# │  └───────────────────────────────────────────────────────┘  │
+# └─────────────────────────────────────────────────────────────┘
+#
+# Testing Autoscaling:
+#
+# # 1. Apply:
+#    kubectl apply -f 07-autoscaling.yaml
+#
+# # 2. Wait for deployment:
+#    kubectl wait --for=condition=ready pod -l app=llama-70b --timeout=600s
+#
+# # 3. Check router HPA:
+#    kubectl get hpa
+#
+# # 4. Generate load (to trigger router scale-up):
+#    for i in {1..1000}; do
+#      curl http://llama-70b-router:8000/v1/models &
+#    done
+#
+# # 5. Watch router autoscaling:
+#    kubectl get hpa -w
+#    kubectl get pods -l component=router -w
+#
+# # 6. To add a backend instance (manual):
+#    # Follow the "How to Scale Backend Instances" script above
+#
+# Autoscaling Best Practices:
+#
+# 1. Use HPA for router (Deployment)
+#    - Scales based on CPU/memory
+#    - No issues with TP configuration
+#
+# 2. Scale backend instances manually
+#    - Create new StatefulSets
+#    - Update router config
+#    - Consider using an operator for automation
+#
+# 3. Long terminationGracePeriod
+#    - Give time for in-flight inference requests
+#    - LLM inference can take minutes!
+#
+# 4. Connection draining
+#    - PreStop hook to stop accepting new requests
+#    - Wait for in-flight requests to complete
+#
+# 5. Router reload strategy
+#    - Use rolling update when updating router config
+#    - Ensures zero downtime

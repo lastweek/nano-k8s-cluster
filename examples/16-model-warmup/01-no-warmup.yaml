@@ -1,0 +1,63 @@
+# No Warm-up Strategy (Baseline)
+#
+# This is the baseline deployment with NO warm-up strategy.
+# The pod becomes "Ready" as soon as the container is running,
+# but the model is NOT loaded yet.
+#
+# Problem: First request will experience 30-60 second delay while model loads.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-no-warmup
+  labels:
+    app: vllm
+    warmup: "none"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vllm
+      warmup: "none"
+  template:
+    metadata:
+      labels:
+        app: vllm
+        warmup: "none"
+    spec:
+      containers:
+      - name: vllm
+        image: vllm-warmup-test:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8000
+          name: http
+        env:
+        - name: MODEL_NAME
+          value: "meta-llama/Llama-3-70B"
+        - name: MODEL_LOADING_TIME
+          value: "30"  # Simulated 30s loading time
+        - name: WARMUP_REQUEST_TIME
+          value: "1"
+        # IMPORTANT: No readiness probe means pod is "Ready" immediately
+        # when container starts, even though model is not loaded!
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "2Gi"
+          limits:
+            cpu: "2"
+            memory: "4Gi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-no-warmup
+spec:
+  selector:
+    app: vllm
+    warmup: "none"
+  ports:
+  - port: 80
+    targetPort: 8000
+  type: ClusterIP

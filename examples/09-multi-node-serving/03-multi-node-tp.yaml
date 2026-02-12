@@ -1,0 +1,303 @@
+# 03: Multi-Node with Tensor Parallelism
+#
+# This example shows how to deploy a model across multiple nodes
+# using tensor parallelism (TP).
+#
+# Scenario: Llama-3-70B model
+# - Requires 8 GPUs total (model doesn't fit on fewer)
+# - We have 2 nodes, each with 4 GPUs
+# - TP size = 8 (split model across all GPUs)
+#
+# What you'll learn:
+# - Tensor parallelism across nodes
+# - Pod anti-affinity (spread pods across nodes)
+# - Distributed init method (pod-to-pod communication)
+# - Shared memory for multi-GPU communication
+
+---
+# Headless service for pod-to-pod communication
+apiVersion: v1
+kind: Service
+metadata:
+  name: llama-3-70b
+  labels:
+    app: llama-3-70b
+spec:
+  clusterIP: None  # Headless - each pod gets own DNS
+  ports:
+  - name: http
+    port: 8000
+    targetPort: 8000
+  - name: p2p
+    port: 5000
+    targetPort: 5000
+  selector:
+    app: llama-3-70b
+
+---
+# StatefulSet with multi-node tensor parallelism
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: llama-3-70b
+  labels:
+    app: llama-3-70b
+spec:
+  serviceName: llama-3-70b  # Headless service for DNS
+  replicas: 2  # 2 nodes, 4 GPUs each = 8 GPUs total
+  selector:
+    matchLabels:
+      app: llama-3-70b
+  template:
+    metadata:
+      labels:
+        app: llama-3-70b
+    spec:
+      # SPREAD PODS ACROSS DIFFERENT NODES
+      # This ensures our 2 replicas go to 2 different nodes
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values:
+                - llama-3-70b
+            topologyKey: kubernetes.io/hostname
+
+      # Select GPU nodes
+      nodeSelector:
+        gpu.node: "true"
+
+      containers:
+      - name: vllm
+        image: vllm/vllm-openai:latest
+        command: ["python", "-m", "vllm.entrypoints.openai.api_server"]
+        args:
+        - --model=meta-llama/Meta-Llama-3-70B
+        # Tensor parallelism across all 8 GPUs (4 per node, 2 nodes)
+        - --tensor-parallel-size=8
+        - --host=0.0.0.0
+        - --port=8000
+        env:
+        # Each pod needs to know its rank
+        # vLLM calculates this from POD_NAME automatically
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+
+        # Distributed init method for coordination
+        # Pod-0 becomes coordinator, others connect to it
+        - name: MASTER_ADDR
+          value: "llama-3-70b-0.llama-3-70b.default.svc.cluster.local"
+
+        # Port for P2P communication
+        - name: MASTER_PORT
+          value: "5000"
+
+        # Total pods (world size in MPI terms)
+        - name: WORLD_SIZE
+          value: "2"
+
+        # CUDA settings for multi-GPU
+        - name: CUDA_VISIBLE_DEVICES
+          value: "0,1,2,3"  # Use all 4 GPUs on this node
+
+        ports:
+        - name: http
+          containerPort: 8000
+        - name: p2p
+          containerPort: 5000  # Port for inter-pod communication
+
+        # Shared memory for multi-GPU communication
+        volumeMounts:
+        - name: shm
+          mountPath: /dev/shm
+
+        resources:
+          requests:
+            nvidia.com/gpu: "4"  # Each pod uses 4 GPUs
+            cpu: "16"
+            memory: "64Gi"
+          limits:
+            nvidia.com/gpu: "4"
+            cpu: "32"
+            memory: "128Gi"
+
+        # Startup probe gives time for model loading
+        startupProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 60  # Model loading takes time
+          periodSeconds: 10
+          failureThreshold: 30  # 5 minutes total
+
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 5
+
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 120
+          periodSeconds: 30
+
+      volumes:
+      # Shared memory for multi-GPU tensor parallelism
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 16Gi  # Large shared memory for GPU communication
+
+# How Tensor Parallelism Works Across Nodes:
+#
+# ┌─────────────────────────────────────────────────────────────┐
+# │  Model: Llama-3-70B (~140GB parameters)                     │
+# │  ┌───────────────────────────────────────────────────────┐ │
+# │  │ Option 1: Single Node                                 │ │
+# │  │ ┌─────────────────────────────────────────────────┐   │ │
+# │  │ │ Node: 1x H100 (80GB)                            │   │ │
+# │  │ │ Problem: Model doesn't fit!                    │   │ │
+# │  │ └─────────────────────────────────────────────────┘   │ │
+# │  └───────────────────────────────────────────────────────┘ │
+# │  ┌───────────────────────────────────────────────────────┐ │
+# │  │ Option 2: Multi-Node TP                              │ │
+# │  │ ┌─────────────────────┐     ┌─────────────────────┐   │ │
+# │  │ │ Node 1              │     │ Node 2              │   │ │
+# │  │ │ [GPU0][GPU1][GPU2][GPU3] │ [GPU4][GPU5][GPU6][GPU7]│   │ │
+# │  │ │ TP rank 0,1,2,3    │     │ TP rank 4,5,6,7    │   │ │
+# │  │ │                     │     │                     │   │ │
+# │  │ │ Model layers 0-31  │ ...  │ Model layers 32-63 │   │ │
+# │  │ │ (35GB per GPU)      │     │ (35GB per GPU)      │   │ │
+# │  │ └─────────────────────┘     └─────────────────────┘   │ │
+# │  │            │                      │                    │ │
+# │  │            └──────────NVLink/PCIe──────────┘            │ │
+# │  │                       │                                 │ │
+# │  │                  All 8 GPUs work together               │ │
+# │  └───────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────┘
+#
+# Startup Sequence:
+#
+# 1. StatefulSet starts pods in order:
+#
+#    ┌───────────────────────────────────────────────────────┐
+#    │  Step 1: Pod-0 starts (Node A)                        │
+#    │  ┌─────────────────────────────────────────────────┐ │
+#    │  │ POD_NAME=llama-3-70b-0                          │ │
+#    │  │ RANK=0 (inferred from pod name)                 │ │
+#    │  │ WORLD_SIZE=2                                     │ │
+#    │  │                                                   │ │
+#    │  │ vLLM starts:                                     │ │
+#    │  │   - Listens on :5000 for P2P connections        │ │
+#    │  │   - Waits for rank 1 to connect                 │ │
+#    │  │   - Becomes coordinator                         │ │
+#    │  └─────────────────────────────────────────────────┘ │
+#    └───────────────────────────────────────────────────────┘
+#                           │
+#                           ▼
+#    ┌───────────────────────────────────────────────────────┐
+#    │  Step 2: Pod-1 starts (Node B)                        │
+#    │  ┌─────────────────────────────────────────────────┐ │
+#    │  │ POD_NAME=llama-3-70b-1                          │ │
+#    │  │ RANK=1 (inferred from pod name)                 │ │
+#    │  │ WORLD_SIZE=2                                     │ │
+#    │  │                                                   │ │
+#    │  │ vLLM starts:                                     │ │
+#    │  │   - Connects to llama-3-70b-0:5000             │ │
+#    │  │   - "I'm rank 1, ready!"                        │ │
+#    │  │   - Waits for initialization signal             │ │
+#    │  └─────────────────────────────────────────────────┘ │
+#    └───────────────────────────────────────────────────────┘
+#                           │
+#                           ▼
+#    ┌───────────────────────────────────────────────────────┐
+#    │  Step 3: Synchronization                               │
+#    │  ┌─────────────────────────────────────────────────┐ │
+#    │  │ Pod-0: "All ranks connected!"                    │ │
+#    │  │ Pod-0: → Broadcasts init signal                  │ │
+#    │  │                                                   │ │
+#    │  │ Both pods:                                       │ │
+#    │  │   - Load model (their portion)                   │ │
+#    │  │   - Initialize communication                     │ │
+#    │  │   - Ready to serve!                             │ │
+#    │  └─────────────────────────────────────────────────┘ │
+#    └───────────────────────────────────────────────────────┘
+#
+# Network Communication:
+#
+# ┌─────────────────────────────────────────────────────────────┐
+# │  Inter-Pod Communication (via headless service DNS)          │
+│  ┌───────────────────────────────────────────────────────┐ │
+#  │ Pod-0 on Node A:                                       │ │
+#  │  - DNS: llama-3-70b-0.llama-3-70b.default.svc.cluster.local│ │
+#  │  - IP: 10.244.1.5                                     │ │
+#  │  - Listens: :5000 (P2P), :8000 (HTTP)                 │ │
+#  │                                                       │ │
+#  │ Pod-1 on Node B:                                       │ │
+#  │  - DNS: llama-3-70b-1.llama-3-70b.default.svc.cluster.local│ │
+#  │  - IP: 10.244.2.5                                     │ │
+#  │  - Connects to: llama-3-70b-0:5000                   │ │
+#  │  - Listens: :5000 (P2P), :8000 (HTTP)                 │ │
+#  └───────────────────────────────────────────────────────┘ │
+│                                                                  │
+│  During inference:                                               │
+│  1. Request comes to either pod-0 or pod-1                     │
+│  2. That pod becomes "orchestrator" for this request            │
+│  3. Pod distributes work across all 8 GPUs (4 on each node)     │
+│  4. GPUs communicate tensors across nodes via :5000             │
+│  5. Response returned when all GPUs complete                    │
+└─────────────────────────────────────────────────────────────┘
+#
+# Testing:
+#
+# 1. Label your nodes as GPU nodes:
+#    kubectl label nodes <node-1> gpu.node=true
+#    kubectl label nodes <node-2> gpu.node=true
+#
+# 2. Apply:
+#    kubectl apply -f 03-multi-node-tp.yaml
+#
+# 3. Watch pods start sequentially:
+#    kubectl get pods -w -l app=llama-3-70b
+#
+# 4. Check which nodes pods are on:
+#    kubectl get pods -l app=llama-3-70b -o wide
+#    # Should see 2 different nodes (due to anti-affinity)
+#
+# 5. Check pod logs (should see TP initialization):
+#    kubectl logs llama-3-70b-0 | grep -i "tensor\|parallel\|rank"
+#    kubectl logs llama-3-70b-1 | grep -i "tensor\|parallel\|rank"
+#
+# 6. Port forward to test:
+#    kubectl port-forward llama-3-70b-0 8000:8000
+#
+# 7. Test inference (request goes to either pod, both handle it):
+#    curl http://localhost:8000/v1/models
+#
+# Expected Log Output:
+#
+# llama-3-70b-0:
+# INFO:     Initializing an LLM engine with config: model=meta-llama/Meta-Llama-3-70B
+# INFO:     Loading model weights (8 GPUs total)
+# INFO:     GPU memory footprint: 35GB per GPU
+# INFO:     Tensor parallel size: 8
+# INFO:     Rank: 0 (coordinator)
+# INFO:     Waiting for rank 1 to connect...
+# INFO:     All 8 ranks connected, initializing model...
+# INFO:     Model loaded, ready to serve!
+#
+# llama-3-70b-1:
+# INFO:     Initializing an LLM engine with config: model=meta-llama/Meta-Llama-3-70B
+# INFO:     Tensor parallel size: 8
+# INFO:     Rank: 1 (worker)
+# INFO:     Connecting to coordinator at llama-3-70b-0:5000...
+# INFO:     Connected to coordinator, waiting for init signal...
+# INFO:     Model loaded, ready to serve!

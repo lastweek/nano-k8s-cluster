@@ -1,0 +1,224 @@
+# 02: Headless Service + Pod Discovery
+#
+# This example shows how pods discover each other using headless services.
+# This is CRITICAL for distributed systems where pods need to communicate.
+#
+# What you'll learn:
+# - What is a headless service (clusterIP: None)
+# - How DNS records work for each pod
+# - How pods discover each other
+# - Why this is needed for multi-node LLMs
+
+---
+# Headless service for pod-to-pod discovery
+apiVersion: v1
+kind: Service
+metadata:
+  name: llama-3-8b-gateway
+  labels:
+    app: llama-3-8b
+spec:
+  type: ClusterIP
+  clusterIP: None  # Headless! Each pod gets own DNS
+  publishNotReadyAddresses: true  # Include pods even if not ready
+  ports:
+  - name: http
+    port: 8000
+    targetPort: 8000
+  selector:
+    app: llama-3-8b
+
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: dns-test
+  labels:
+    app: dns-test
+spec:
+  restartPolicy: Never
+  containers:
+  - name: test
+    image: nicolaka/netshoot
+    command: ["sleep", "3600"]
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: llama-3-8b
+  labels:
+    app: llama-3-8b
+spec:
+  serviceName: llama-3-8b-gateway  # References headless service
+  replicas: 3
+  selector:
+    matchLabels:
+      app: llama-3-8b
+  template:
+    metadata:
+      labels:
+        app: llama-3-8b
+    spec:
+      containers:
+      - name: vllm
+        image: vllm/vllm-openai:latest
+        command: ["python", "-m", "vllm.entrypoints.openai.api_server"]
+        args:
+        - --model=meta-llama/Meta-Llama-3-8B
+        - --host=0.0.0.0
+        - --port=8000
+        env:
+        # Pods need to know their ordinal index
+        # In example 05 we'll use this for rank assignment
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        ports:
+        - name: http
+          containerPort: 8000
+        resources:
+          requests:
+            cpu: "2"
+            memory: "8Gi"
+          limits:
+            cpu: "4"
+            memory: "16Gi"
+
+# Headless Service DNS Records:
+#
+# ┌─────────────────────────────────────────────────────────────┐
+# |  Regular Service (clusterIP assigned)                         |
+# |  ┌───────────────────────────────────────────────────────┐ |
+# |  | Service: my-service (IP: 10.0.0.100)                   | |
+# |  |                                                       | |
+# |  | DNS: my-service.default.svc.cluster.local → 10.0.0.100| |
+# |  |                                                       | |
+# |  | Requests to service are load balanced across pods    | |
+# |  └───────────────────────────────────────────────────────┘ |
+└─────────────────────────────────────────────────────────────┘
+#                           |
+#                           ▼
+# ┌─────────────────────────────────────────────────────────────┐
+# |  Headless Service (clusterIP: None)                          |
+# |  ┌───────────────────────────────────────────────────────┐ |
+# |  | Service: llama-3-8b-gateway (No clusterIP)             | |
+# |  |                                                       | |
+# |  | DNS records:                                          | |
+# |  |  llama-3-8b-gateway.default.svc.cluster.local        | |
+# |  |    → Round-robin A record of all pods                | |
+# |  |                                                       | |
+# |  |  Individual pod DNS:                                  | |
+# |  |  llama-3-8b-0.llama-3-8b-gateway.default.svc.cluster.local| |
+# |  |    → A record: 10.0.1.5                             | |
+# |  |  llama-3-8b-1.llama-3-8b-gateway.default.svc.cluster.local| |
+# |  |    → A record: 10.0.1.6                             | |
+# |  |  llama-3-8b-2.llama-3-8b-gateway.default.svc.cluster.local| |
+# |  |    → A record: 10.0.1.7                             | |
+# |  └───────────────────────────────────────────────────────┘ |
+└─────────────────────────────────────────────────────────────┘
+#
+# How Pods Discover Each Other:
+#
+# 1. Pod-0 starts:
+#    → Knows its name: llama-3-8b-0
+#    → Knows its rank: 0 (from ordinal)
+#    → Listens for connections
+#
+# 2. Pod-1 starts:
+#    → Knows its name: llama-3-8b-1
+#    → Knows its rank: 1 (from ordinal)
+#    → DNS resolves: llama-3-8b-0.llama-3-8b-gateway.default.svc.cluster.local
+#    → Connects to pod-0: "I'm rank 1, ready to work"
+#
+# 3. Pod-2 starts:
+#    → Knows its name: llama-3-8b-2
+#    → Knows its rank: 2 (from ordinal)
+#    → DNS resolves: llama-3-8b-0.llama-3-8b-gateway.default.svc.cluster.local
+#    → Connects to pod-0: "I'm rank 2, ready to work"
+#
+# Why This Matters for Distributed Inference:
+#
+# For tensor parallelism, workers need to:
+# 1. Discover the coordinator (rank 0)
+# 2. Know their own rank
+# 3. Establish peer-to-peer connections
+# 4. Synchronize initialization
+#
+# Headless services enable ALL of this!
+#
+# Testing DNS Discovery:
+#
+# 1. Apply:
+#    kubectl apply -f 02-headless-service.yaml
+#
+# 2. Wait for pods to be ready:
+#    kubectl wait --for=condition=ready pod -l app=llama-3-8b --timeout=120s
+#
+# 3. Enter the test pod:
+#    kubectl exec -it dns-test -- bash
+#
+# 4. Test DNS resolution inside the pod:
+#
+#    # Test service DNS (round-robin)
+#    nslookup llama-3-8b-gateway
+#    # Shows A records for all pods
+#
+#    # Test individual pod DNS
+#    nslookup llama-3-8b-0.llama-3-8b-gateway.default.svc.cluster.local
+#    nslookup llama-3-8b-1.llama-3-8b-gateway.default.svc.cluster.local
+#    nslookup llama-3-8b-2.llama-3-8b-gateway.default.svc.cluster.local
+#
+#    # Test connectivity
+#    curl http://llama-3-8b-0.llama-3-8b-gateway.default.svc.cluster.local:8000/health
+#    curl http://llama-3-8b-1.llama-3-8b-gateway.default.svc.cluster.local:8000/health
+#    curl http://llama-3-8b-2.llama-3-8b-gateway.default.svc.cluster.local:8000/health
+#
+# 5. List all DNS records:
+#    kubectl exec dns-test -- nslookup llama-3-8b-gateway
+#
+# Comparison: Regular vs Headless
+#
+# ┌─────────────────────────────────────────────────────────────┐
+# |  Regular Service                                            |
+# |  ┌───────────────────────────────────────────────────────┐ |
+# |  | kubectl apply -f service.yaml                        | |
+# |  |                                                       | |
+# |  | Service: my-service (IP: 10.0.0.100)                | |
+# |  |                                                       | |
+# |  | DNS: my-service.default.svc.cluster.local           | |
+# |  |   → 10.0.0.100 (single IP)                           | |
+# |  |                                                       | |
+# |  | Request flow:                                        | |
+# |  |   Client → Service IP → Kube-Proxy → Random Pod      | |
+# |  |                                                       | |
+# |  | Client doesn't know which pod served request         | |
+# |  └───────────────────────────────────────────────────────┘ |
+└─────────────────────────────────────────────────────────────┘
+#
+# ┌─────────────────────────────────────────────────────────────┐
+# |  Headless Service                                           |
+# |  ┌───────────────────────────────────────────────────────┐ |
+# |  | kubectl apply -f headless.yaml                       | |
+# |  |                                                       | |
+# |  | Service: my-service (clusterIP: None)                 | |
+# |  |                                                       | |
+# |  | DNS: my-service.default.svc.cluster.local           | |
+# |  |   → Returns ALL pod IPs (no proxy)                   | |
+# |  |                                                       | |
+# |  | Pod DNS:                                              | |
+# |  |   pod-0.my-service.default.svc.cluster.local         | |
+# |  |   pod-1.my-service.default.svc.cluster.local         | |
+# |  |   pod-2.my-service.default.svc.cluster.local         | |
+# |  |                                                       | |
+# |  | Request flow:                                        | |
+# |  |   Client → DNS → Pod IP (direct, no proxy)           | |
+# |  |                                                       | |
+# |  | Client knows EXACTLY which pod it's talking to       | |
+# |  └───────────────────────────────────────────────────────┘ |
+└─────────────────────────────────────────────────────────────┘

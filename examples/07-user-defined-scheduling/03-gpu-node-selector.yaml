@@ -1,0 +1,295 @@
+# GPU Node Selector Example
+#
+# This example demonstrates how to use nodeSelector to schedule pods
+# to specific GPU types (H100, A100, L40S, T4).
+#
+# What you'll learn:
+# - How to label nodes with GPU type
+# - How to use nodeSelector for hard scheduling requirements
+# - How to deploy different models to different GPU types
+#
+# Prerequisites:
+# - Run 01-gpu-node-labeling.sh first to label your nodes
+
+---
+# Example 1: Schedule to H100 nodes only
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llama-3-70b-h100
+  labels:
+    app: llama-3-70b
+    gpu-type: h100
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: llama-3-70b
+      gpu-type: h100
+  template:
+    metadata:
+      labels:
+        app: llama-3-70b
+        gpu-type: h100
+    spec:
+      # Hard requirement: Only H100 nodes
+      nodeSelector:
+        nvidia.com/gpu.product: H100
+
+      containers:
+      - name: vllm
+        image: vllm/vllm-openai:latest
+        command: ["python", "-m", "vllm.entrypoints.openai.api_server"]
+        args:
+        - --model=meta-llama/Meta-Llama-3-70B
+        - --tensor-parallel-size=4
+        - --host=0.0.0.0
+        - --port=8000
+        env:
+        - name: CUDA_VISIBLE_DEVICES
+          value: "0,1,2,3"
+        ports:
+        - name: http
+          containerPort: 8000
+        resources:
+          requests:
+            nvidia.com/gpu: "4"
+            memory: "64Gi"
+          limits:
+            nvidia.com/gpu: "4"
+            memory: "128Gi"
+
+---
+# Example 2: Schedule to A100 nodes only
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deepseek-v2-a100
+  labels:
+    app: deepseek-v2
+    gpu-type: a100
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: deepseek-v2
+      gpu-type: a100
+  template:
+    metadata:
+      labels:
+        app: deepseek-v2
+        gpu-type: a100
+    spec:
+      # Hard requirement: Only A100 nodes
+      nodeSelector:
+        nvidia.com/gpu.product: A100-80GB
+
+      containers:
+      - name: vllm
+        image: vllm/vllm-openai:latest
+        command: ["python", "-m", "vllm.entrypoints.openai.api_server"]
+        args:
+        - --model=deepseek-ai/DeepSeek-V2
+        - --tensor-parallel-size=8
+        - --host=0.0.0.0
+        - --port=8000
+        ports:
+        - name: http
+          containerPort: 8000
+        resources:
+          requests:
+            nvidia.com/gpu: "8"
+            memory: "128Gi"
+          limits:
+            nvidia.com/gpu: "8"
+            memory: "256Gi"
+
+---
+# Example 3: Schedule to L40S nodes (for smaller models)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llama-3-8b-l40s
+  labels:
+    app: llama-3-8b
+    gpu-type: l40s
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: llama-3-8b
+      gpu-type: l40s
+  template:
+    metadata:
+      labels:
+        app: llama-3-8b
+        gpu-type: l40s
+    spec:
+      # Hard requirement: Only L40S nodes
+      nodeSelector:
+        nvidia.com/gpu.product: L40S
+
+      containers:
+      - name: vllm
+        image: vllm/vllm-openai:latest
+        command: ["python", "-m", "vllm.entrypoints.openai.api_server"]
+        args:
+        - --model=meta-llama/Meta-Llama-3-8B
+        - --tensor-parallel-size=2
+        - --host=0.0.0.0
+        - --port=8000
+        ports:
+        - name: http
+          containerPort: 8000
+        resources:
+          requests:
+            nvidia.com/gpu: "2"
+            memory: "32Gi"
+          limits:
+            nvidia.com/gpu: "2"
+            memory: "64Gi"
+
+---
+# Example 4: Schedule to ANY GPU node (fallback)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mistral-7b-any-gpu
+  labels:
+    app: mistral-7b
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: mistral-7b
+  template:
+    metadata:
+      labels:
+        app: mistral-7b
+    spec:
+      # No GPU type specified - will go to any GPU node
+      nodeSelector:
+        gpu.node: "true"
+
+      containers:
+      - name: vllm
+        image: vllm/vllm-openai:latest
+        command: ["python", "-m", "vllm.entrypoints.openai.api_server"]
+        args:
+        - --model=mistralai/Mistral-7B-v0.3
+        - --tensor-parallel-size=1
+        - --host=0.0.0.0
+        - --port=8000
+        ports:
+        - name: http
+          containerPort: 8000
+        resources:
+          requests:
+            nvidia.com/gpu: "1"
+            memory: "16Gi"
+          limits:
+            nvidia.com/gpu: "1"
+            memory: "32Gi"
+
+---
+# Example 5: Combine multiple node selectors
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: production-model-h100-zone-a
+  labels:
+    app: production-model
+    env: production
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: production-model
+      env: production
+  template:
+    metadata:
+      labels:
+        app: production-model
+        env: production
+    spec:
+      # Multiple selectors (ALL must match)
+      nodeSelector:
+        nvidia.com/gpu.product: H100
+        topology.kubernetes.io/zone: us-west-1a
+        node-type: production
+
+      containers:
+      - name: vllm
+        image: vllm/vllm-openai:latest
+        command: ["sleep", "3600"]
+        resources:
+          requests:
+            nvidia.com/gpu: "4"
+          limits:
+            nvidia.com/gpu: "4"
+
+---
+# How Node Selector Works:
+#
+# ┌─────────────────────────────────────────────────────────────┐
+# │  Node Labeling Phase (01-gpu-node-labeling.sh)              │
+# │  ┌───────────────────────────────────────────────────────┐ │
+# │  │ kubectl label node node-1 nvidia.com/gpu.product=H100 │ │
+# │  │ kubectl label node node-2 nvidia.com/gpu.product=A100 │ │
+# │  │ kubectl label node node-3 nvidia.com/gpu.product=T4   │ │
+# │  └───────────────────────────────────────────────────────┘ │
+# └─────────────────────────────────────────────────────────────┘
+#                           │
+#                           ▼
+# ┌─────────────────────────────────────────────────────────────┐
+# │  Pod Scheduling Phase (this file)                           │
+# │  ┌───────────────────────────────────────────────────────┐ │
+# │  │ spec:                                                 │ │
+# │  │   nodeSelector:                                      │ │
+# │  │     nvidia.com/gpu.product: H100                    │ │
+# │  └───────────────────────────────────────────────────────┘ │
+# └─────────────────────────────────────────────────────────────┘
+#                           │
+#                           ▼
+# ┌─────────────────────────────────────────────────────────────┐
+# │  Scheduler Decision                                         │
+# │  ┌───────────────────────────────────────────────────────┐ │
+# │  │ "Only schedule to nodes with label H100"              │ │
+# │  │ → Pod goes to node-1                                  │ │
+# │  └───────────────────────────────────────────────────────┘ │
+# └─────────────────────────────────────────────────────────────┘
+#
+# Key Points:
+#
+# 1. nodeSelector is a HARD requirement
+#    - If no matching nodes exist, pod stays Pending
+#    - No fuzzy matching or fallback
+#
+# 2. All selectors must match (AND logic)
+#    nodeSelector:
+#      gpu-type: H100
+#      zone: us-west-1a
+#    → Node must have BOTH labels
+#
+# 3. Use for simple, binary requirements
+#    - "I need H100 GPUs" → nodeSelector
+#    - "I prefer H100 but A100 is OK" → nodeAffinity (see next example)
+#
+# Testing:
+#
+# 1. Label your nodes first:
+#    ./01-gpu-node-labeling.sh
+#
+# 2. Add specific GPU type labels:
+#    kubectl label node <node-name> nvidia.com/gpu.product=H100
+#    kubectl label node <node-name> nvidia.com/gpu.product=A100-80GB
+#
+# 3. Apply this file:
+#    kubectl apply -f 03-gpu-node-selector.yaml
+#
+# 4. Check where pods were scheduled:
+#    kubectl get pods -o wide
+#
+# 5. Verify each pod is on the right GPU type:
+#    kubectl get pods -o wide -l gpu-type=h100
+#    kubectl get pods -o wide -l gpu-type=a100

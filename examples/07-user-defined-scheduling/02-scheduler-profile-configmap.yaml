@@ -1,0 +1,306 @@
+# Scheduler Profile Configuration
+#
+# This ConfigMap configures the Kubernetes default scheduler with custom profiles.
+# Scheduler profiles allow you to have multiple scheduling "strategies" active.
+#
+# What this does:
+# - Creates a scheduler configuration with multiple profiles
+# - Each profile has different plugin chains
+# - Pods can choose which profile to use via schedulerName
+#
+# Architecture:
+#
+# ┌─────────────────────────────────────────────────────────────────┐
+# │  Default Scheduler (kube-scheduler)                             │
+# │  ┌───────────────────────────────────────────────────────────┐ │
+# │  │  Profile 1: default-scheduler                              │ │
+# │  │  - Standard scheduling plugins                            │ │
+# │  │  - Good for general workloads                             │ │
+# │  └───────────────────────────────────────────────────────────┘ │
+# │  ┌───────────────────────────────────────────────────────────┐ │
+# │  │  Profile 2: gpu-scheduler                                 │ │
+# │  │  - GPU-aware scheduling                                   │ │
+# │  │  - Binpack for GPU consolidation                          │ │
+# │  └───────────────────────────────────────────────────────────┘ │
+# │  ┌───────────────────────────────────────────────────────────┐ │
+# │  │  Profile 3: spread-scheduler                              │ │
+# │  │  - Spread across zones                                    │ │
+# │  │  - High availability focus                                │ │
+# │  └───────────────────────────────────────────────────────────┘ │
+# └─────────────────────────────────────────────────────────────────┘
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: scheduler-config
+  namespace: kube-system
+data:
+  config.yaml: |
+    apiVersion: kubescheduler.config.k8s.io/v1
+    kind: KubeSchedulerConfiguration
+    profiles:
+    # Profile 1: Default scheduler
+    - schedulerName: default-scheduler
+      plugins:
+        queueSort:
+          enabled:
+          - name: PrioritySort
+        preFilter:
+          enabled:
+          - name: NodeResourcesFit
+          - name: NodePorts
+          - name: NodeAffinity
+          - name: TaintToleration
+        filter:
+          enabled:
+          - name: NodeUnschedulable
+          - name: NodeName
+          - name: NodePort
+          - name: NodeAffinity
+          - name: TaintToleration
+        preScore:
+          enabled:
+          - name: InterPodAffinity
+          - name: NodeResourcesFit
+        score:
+          enabled:
+          - name: NodeResourcesFit
+          weight: 1
+          - name: NodeAffinity
+          weight: 1
+          - name: InterPodAffinity
+          weight: 1
+        reserve:
+          enabled:
+          - name: VolumeBinding
+        permit:
+          enabled:
+          - name: VolumeBinding
+        bind:
+          enabled:
+          - name: DefaultBinder
+      pluginConfig:
+      - name: NodeResourcesFit
+        args:
+          scoringStrategy:
+            type: LeastAllocated
+            resources:
+            - name: cpu
+              weight: 1
+            - name: memory
+              weight: 1
+            - name: nvidia.com/gpu
+              weight: 2
+
+    # Profile 2: GPU scheduler (binpack strategy)
+    - schedulerName: gpu-scheduler
+      plugins:
+        queueSort:
+          enabled:
+          - name: PrioritySort
+        preFilter:
+          enabled:
+          - name: NodeResourcesFit
+          - name: NodeAffinity
+          - name: TaintToleration
+        filter:
+          enabled:
+          - name: NodeUnschedulable
+          - name: NodeAffinity
+          - name: TaintToleration
+          - name: NodeResourcesFit
+        preScore:
+          enabled:
+          - name: InterPodAffinity
+          - name: NodeResourcesFit
+        score:
+          enabled:
+          - name: NodeResourcesFit
+          weight: 10
+          - name: NodeAffinity
+          weight: 5
+          - name: InterPodAffinity
+          weight: 3
+      pluginConfig:
+      - name: NodeResourcesFit
+        args:
+          scoringStrategy:
+            type: MostAllocated  # Binpack - fill nodes first
+            resources:
+            - name: nvidia.com/gpu
+              weight: 10
+            - name: cpu
+              weight: 1
+            - name: memory
+              weight: 1
+
+    # Profile 3: Spread scheduler (high availability)
+    - schedulerName: spread-scheduler
+      plugins:
+        queueSort:
+          enabled:
+          - name: PrioritySort
+        preFilter:
+          enabled:
+          - name: NodeResourcesFit
+          - name: NodeAffinity
+          - name: TaintToleration
+          - name: PodTopologySpread
+        filter:
+          enabled:
+          - name: NodeUnschedulable
+          - name: NodeAffinity
+          - name: TaintToleration
+        preScore:
+          enabled:
+          - name: InterPodAffinity
+          - name: NodeResourcesFit
+          - name: PodTopologySpread
+        score:
+          enabled:
+          - name: NodeResourcesFit
+          weight: 1
+          - name: NodeAffinity
+          weight: 2
+          - name: InterPodAffinity
+          weight: 3
+          - name: PodTopologySpread
+          weight: 10  # High weight for spreading
+      pluginConfig:
+      - name: NodeResourcesFit
+        args:
+          scoringStrategy:
+            type: LeastAllocated  # Spread out
+            resources:
+            - name: cpu
+              weight: 1
+            - name: memory
+              weight: 1
+            - name: nvidia.com/gpu
+              weight: 2
+
+---
+# Example Pod using default scheduler
+apiVersion: v1
+kind: Pod
+metadata:
+  name: example-default-scheduler
+  labels:
+    app: example-scheduler
+spec:
+  schedulerName: default-scheduler
+  containers:
+  - name: nginx
+    image: nginx:latest
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+
+---
+# Example Pod using GPU scheduler (binpack)
+apiVersion: v1
+kind: Pod
+metadata:
+  name: example-gpu-scheduler
+  labels:
+    app: example-scheduler
+spec:
+  schedulerName: gpu-scheduler
+  nodeSelector:
+    gpu.node: "true"
+  containers:
+  - name: gpu-workload
+    image: python:3.11-slim
+    command: ["sleep", "3600"]
+    resources:
+      requests:
+        nvidia.com/gpu: "1"
+      limits:
+        nvidia.com/gpu: "1"
+
+---
+# Example Pod using spread scheduler
+apiVersion: v1
+kind: Pod
+metadata:
+  name: example-spread-scheduler
+  labels:
+    app: example-scheduler
+spec:
+  schedulerName: spread-scheduler
+  containers:
+  - name: nginx
+    image: nginx:latest
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+
+---
+# How to Use This Configuration:
+#
+# 1. The ConfigMap defines scheduler configuration
+# 2. To actually use it, you need to:
+#    a. Create a scheduler Deployment with this config mounted
+#    b. Or update the existing kube-scheduler to use this config
+#
+# Example scheduler deployment:
+#
+# apiVersion: apps/v1
+# kind: Deployment
+# metadata:
+#   name: custom-scheduler
+#   namespace: kube-system
+# spec:
+#   replicas: 1
+#   selector:
+#     matchLabels:
+#       app: custom-scheduler
+#   template:
+#     metadata:
+#       labels:
+#         app: custom-scheduler
+#     spec:
+#       containers:
+#       - name: kube-scheduler
+#         image: registry.k8s.io/kube-scheduler:v1.29.0
+#         command:
+#         - kube-scheduler
+#         - --config=/config/config.yaml
+#         - --v=2
+#         volumeMounts:
+#         - name: config
+#           mountPath: /config
+#       volumes:
+#       - name: config
+#         configMap:
+#           name: scheduler-config
+#
+# 3. Then in your pods, specify schedulerName:
+#    spec:
+#      schedulerName: gpu-scheduler  # or spread-scheduler
+#
+# Key Differences Between Profiles:
+#
+# ┌─────────────────────────────────────────────────────────────┐
+# │  default-scheduler                                          │
+# │  Strategy: LeastAllocated                                   │
+# │  Goal: Balance resources across nodes                       │
+# │  Best for: General workloads                               │
+# └─────────────────────────────────────────────────────────────┘
+#
+# ┌─────────────────────────────────────────────────────────────┐
+# │  gpu-scheduler                                              │
+# │  Strategy: MostAllocated (Binpack)                          │
+# │  Goal: Fill GPU nodes first                                 │
+# │  Best for: GPU consolidation, leave nodes empty for scale  │
+# └─────────────────────────────────────────────────────────────┘
+#
+# ┌─────────────────────────────────────────────────────────────┐
+# │  spread-scheduler                                           │
+# │  Strategy: High topology spread weight                      │
+# │  Goal: Spread across zones/nodes                            │
+# │  Best for: High availability                               │
+# └─────────────────────────────────────────────────────────────┘

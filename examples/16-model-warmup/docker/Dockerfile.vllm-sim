@@ -1,0 +1,18 @@
+# Simulated vLLM server for warm-up testing
+# This simulates the behavior of vLLM with realistic model loading times
+
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install dependencies
+RUN pip install --no-cache-dir fastapi uvicorn httpx pydantic
+
+# Copy the application
+COPY app.py /app/app.py
+
+# Expose port
+EXPOSE 8000
+
+# Run the application
+CMD ["python", "-u", "app.py"]

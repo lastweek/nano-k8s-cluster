@@ -1,0 +1,447 @@
+# Priority Classes Example
+#
+# This example demonstrates how to use priority classes to control
+# which pods get scheduled first and which pods can be preempted.
+# This is useful for:
+# - Production vs development workloads
+# - Critical services vs batch jobs
+# - SLA-guaranteed workloads
+# - Cost optimization (spot vs on-demand)
+#
+# What you'll learn:
+# - How to create priority classes
+# - How preemption works
+# - Global default priority
+# - Production vs dev priority patterns
+
+---
+# Priority Class 1: Production critical (highest priority)
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: production-critical
+value: 1000
+globalDefault: false
+description: "Critical production workloads - highest priority, never preempted"
+
+---
+# Priority Class 2: Production high
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: production-high
+value: 800
+globalDefault: false
+description: "High priority production workloads"
+
+---
+# Priority Class 3: Production normal
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: production-normal
+value: 600
+globalDefault: false
+description: "Normal production workloads"
+
+---
+# Priority Class 4: Development high
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: development-high
+value: 400
+globalDefault: false
+description: "High priority development/experimental workloads"
+
+---
+# Priority Class 5: Development normal
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: development-normal
+value: 200
+globalDefault: false
+description: "Normal development workloads"
+
+---
+# Priority Class 6: Batch jobs (lowest priority)
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: batch-job
+value: 100
+globalDefault: false
+description: "Batch processing jobs - can be preempted anytime"
+
+---
+# Priority Class 7: Cluster default
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: cluster-default
+value: 0
+globalDefault: true  # This is the default for pods without priorityClassName
+description: "Default priority for all pods"
+
+---
+# Example 1: Critical production model (highest priority)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: critical-production-model
+  labels:
+    app: critical-production-model
+    priority: critical
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: critical-production-model
+  template:
+    metadata:
+      labels:
+        app: critical-production-model
+        priority: critical
+    spec:
+      priorityClassName: production-critical  # value: 1000
+
+      nodeSelector:
+        gpu.node: "true"
+
+      containers:
+      - name: vllm
+        image: vllm/vllm-openai:latest
+        command: ["python", "-m", "vllm.entrypoints.openai.api_server"]
+        args:
+        - --model=meta-llama/Meta-Llama-3-70B
+        - --tensor-parallel-size=4
+        - --host=0.0.0.0
+        - --port=8000
+        ports:
+        - name: http
+          containerPort: 8000
+        resources:
+          requests:
+            nvidia.com/gpu: "4"
+            cpu: "8"
+            memory: "64Gi"
+          limits:
+            nvidia.com/gpu: "4"
+            cpu: "16"
+            memory: "128Gi"
+        env:
+        - name: LOG_LEVEL
+          value: "INFO"
+        - name: SLA_PRIORITY
+          value: "CRITICAL"
+
+---
+# Example 2: Normal production model
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: normal-production-model
+  labels:
+    app: normal-production-model
+    priority: normal
+spec:
+  replicas: 6
+  selector:
+    matchLabels:
+      app: normal-production-model
+  template:
+    metadata:
+      labels:
+        app: normal-production-model
+        priority: normal
+    spec:
+      priorityClassName: production-normal  # value: 600
+
+      nodeSelector:
+        gpu.node: "true"
+
+      containers:
+      - name: vllm
+        image: vllm/vllm-openai:latest
+        command: ["python", "-m", "vllm.entrypoints.openai.api_server"]
+        args:
+        - --model=meta-llama/Meta-Llama-3-8B
+        - --host=0.0.0.0
+        - --port=8000
+        ports:
+        - name: http
+          containerPort: 8000
+        resources:
+          requests:
+            nvidia.com/gpu: "1"
+            cpu: "2"
+            memory: "16Gi"
+          limits:
+            nvidia.com/gpu: "1"
+            cpu: "4"
+            memory: "32Gi"
+
+---
+# Example 3: Development model (lower priority)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: development-model
+  labels:
+    app: development-model
+    priority: development
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: development-model
+  template:
+    metadata:
+      labels:
+        app: development-model
+        priority: development
+    spec:
+      priorityClassName: development-high  # value: 400
+
+      nodeSelector:
+        gpu.node: "true"
+
+      containers:
+      - name: vllm
+        image: vllm/vllm-openai:latest
+        command: ["python", "-m", "vllm.entrypoints.openai.api_server"]
+        args:
+        - --model=mistralai/Mistral-7B-v0.3
+        - --host=0.0.0.0
+        - --port=8000
+        ports:
+        - name: http
+          containerPort: 8000
+        resources:
+          requests:
+            nvidia.com/gpu: "1"
+            memory: "16Gi"
+          limits:
+            nvidia.com/gpu: "1"
+            memory: "32Gi"
+        env:
+        - name: LOG_LEVEL
+          value: "DEBUG"
+
+---
+# Example 4: Batch training job (lowest priority, preemptible)
+apiVersion: apps/v1
+kind: Job
+metadata:
+  name: batch-training-job
+  labels:
+    app: batch-training
+    priority: batch
+spec:
+  completions: 1
+  parallelism: 1
+  backoffLimit: 4
+  template:
+    metadata:
+      labels:
+        app: batch-training
+        priority: batch
+    spec:
+      priorityClassName: batch-job  # value: 100 (lowest!)
+      restartPolicy: OnFailure
+
+      nodeSelector:
+        gpu.node: "true"
+
+      containers:
+      - name: trainer
+        image: pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime
+        command: ["python", "-c"]
+        args:
+        - |
+          import time
+          print("Starting training...")
+          for i in range(100):
+              print(f"Step {i}/100")
+              time.sleep(10)
+          print("Training complete!")
+        resources:
+          requests:
+            nvidia.com/gpu: "4"
+            cpu: "8"
+            memory: "64Gi"
+          limits:
+            nvidia.com/gpu: "4"
+            cpu: "16"
+            memory: "128Gi"
+
+---
+# Example 5: No priority class specified (uses global default)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: default-priority-model
+  labels:
+    app: default-priority-model
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: default-priority-model
+  template:
+    metadata:
+      labels:
+        app: default-priority-model
+    spec:
+      # No priorityClassName - uses cluster-default (value: 0)
+
+      nodeSelector:
+        gpu.node: "true"
+
+      containers:
+      - name: vllm
+        image: vllm/vllm-openai:latest
+        command: ["sleep", "3600"]
+        resources:
+          requests:
+            nvidia.com/gpu: "1"
+
+---
+# How Priority Classes Work:
+#
+# ┌─────────────────────────────────────────────────────────────┐
+# │  Pod Scheduling with Priority                               │
+# │  ┌───────────────────────────────────────────────────────┐ │
+# │  │ Scheduler Queue (sorted by priority)                  │ │
+# │  │ 1. [Critical Prod]   Priority: 1000  ← Schedule first│ │
+# │  │ 2. [High Prod]       Priority: 800                   │ │
+# │  │ 3. [Normal Prod]     Priority: 600                   │ │
+# │  │ 4. [Dev High]        Priority: 400                   │ │
+# │  │ 5. [Dev Normal]      Priority: 200                   │ │
+# │  │ 6. [Batch Job]       Priority: 100   ← Schedule last │ │
+# │  │ 7. [No class]        Priority: 0                    │ │
+# │  └───────────────────────────────────────────────────────┘ │
+# └─────────────────────────────────────────────────────────────┘
+#
+# What Happens When Cluster is Full?
+#
+# Scenario: Cluster has 4 GPUs, all occupied
+#
+# ┌─────────────────────────────────────────────────────────────┐
+# │  Current State                                              │
+# │  ┌───────────────────────────────────────────────────────┐ │
+# │  │ GPU 1: [Batch Job]        Priority: 100              │ │
+# │  │ GPU 2: [Batch Job]        Priority: 100              │ │
+# │  │ GPU 3: [Dev Model]        Priority: 400              │ │
+# │  │ GPU 4: [Normal Prod]      Priority: 600              │ │
+# │  └───────────────────────────────────────────────────────┘ │
+# └─────────────────────────────────────────────────────────────┘
+#                           │
+#                           ▼ New pod arrives
+# ┌─────────────────────────────────────────────────────────────┐
+# │  New Pod: Critical Production (Priority: 1000)              │
+# │  ┌───────────────────────────────────────────────────────┐ │
+# │  │ PREEMPTION happens!                                   │ │
+# │  │ 1. Scheduler finds lowest priority pods               │ │
+# │  │ 2. Batch Job pods (Priority 100) are chosen           │ │
+# │  │ 3. Batch Job pods are EVICTED (killed)                │ │
+# │  │ 4. Critical pod gets the GPUs                         │ │
+# │  │ 5. Batch Job will be rescheduled later               │ │
+# │  └───────────────────────────────────────────────────────┘ │
+# └─────────────────────────────────────────────────────────────┘
+#
+# Priority Value Range:
+#
+# ┌─────────────────────────────────────────────────────────────┐
+# │  -2147483648  (System reserved)                            │
+# │  ↓                                                          │
+# │  -1000000000  (System critical pods)                       │
+# │  ↓                                                          │
+# │  0            (Default, most pods)                         │
+# │  ↓                                                          │
+# │  1000000000   (Highest user-defined priority)              │
+# │  ↓                                                          │
+# │  2147483647   (System reserved)                            │
+# └─────────────────────────────────────────────────────────────┘
+#
+# Best Practices:
+#
+# 1. Production Workloads
+#    priorityClassName: production-critical (1000)
+#    - Never preempted
+#    - SLA guarantees
+#    - Customer-facing services
+#
+# 2. Internal Production
+#    priorityClassName: production-normal (600)
+#    - Rarely preempted
+#    - Internal services
+#    - Non-critical production
+#
+# 3. Development
+#    priorityClassName: development-high (400)
+#    - Can be preempted by production
+#    - Dev, test, experimental
+#
+# 4. Batch Jobs
+#    priorityClassName: batch-job (100)
+#    - Always preemptible
+#    - Training, ETL, background jobs
+#    - Use spot instances
+#
+# Preemption Rules:
+#
+# 1. Only pods with LOWER priority are preempted
+# 2. Preemption tries to minimize pods killed (prefer 1 pod vs 2)
+# 3. Preemption only happens if higher priority pod can't schedule otherwise
+# 4. System pods (kube-system) are rarely preempted
+# 5. Preemption respects PodDisruptionBudgets
+#
+# Testing:
+#
+# 1. Create priority classes:
+#    kubectl apply -f 07-priority-classes.yaml
+#
+# 2. Check priority classes:
+#    kubectl get priorityclasses
+#    kubectl get pc  # short name
+#
+# 3. Deploy all workloads:
+#    kubectl apply -f 07-priority-classes.yaml
+#
+# 4. Check pod priorities:
+#    kubectl get pods -o custom-columns=NAME:.metadata.name,PRIORITY:.spec.priorityClassName
+#
+# 5. Fill cluster to capacity:
+#    kubectl scale deployment default-priority-model --replicas=100
+#
+# 6. Observe scheduling order:
+#    kubectl get pods --sort-by=.spec.priorityClassName
+#    # Critical pods schedule first!
+#
+# 7. Trigger preemption:
+#    # Scale down critical pods, let cluster fill with low priority
+#    kubectl scale deployment critical-production-model --replicas=0
+#    # Wait for low priority pods to fill cluster
+#    # Scale critical back up
+#    kubectl scale deployment critical-production-model --replicas=4
+#    # Watch low priority pods get evicted!
+#
+# Real-World Production Setup:
+#
+# Priority Classes:
+# - production-critical: 1000  (Customer-facing, SLA)
+# - production-normal:   600   (Internal production)
+# - development:         400   (Dev, test, staging)
+# - batch:               100   (Training, jobs)
+#
+# Resource Quotas:
+# - Production team: Can use priority 600+
+# - Development team: Can use priority 400-500
+# - Data science: Can use priority 100-300
+#
+# Cost Optimization:
+# - Use spot instances for priority < 500
+# - Use on-demand for priority >= 600
+# - Automatic cost savings!

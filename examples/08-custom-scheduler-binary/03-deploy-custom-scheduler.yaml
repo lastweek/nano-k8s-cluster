@@ -1,0 +1,338 @@
+# Deploy Custom Scheduler
+#
+# This manifest deploys a custom scheduler as a Deployment in Kubernetes.
+# The scheduler will watch for pods with schedulerName matching its name.
+
+---
+# ServiceAccount for the scheduler
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: custom-scheduler
+  namespace: default
+
+---
+# ClusterRole with scheduler permissions
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: custom-scheduler
+rules:
+- apiGroups: [""]
+  resources: ["pods", "pods/binding", "pods/status"]
+  verbs: ["get", "list", "watch", "create", "update", "patch"]
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["persistentvolumes", "persistentvolumeclaims"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["storage.k8s.io"]
+  resources: ["storageclasses"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["create", "update", "patch"]
+
+---
+# ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: custom-scheduler
+subjects:
+- kind: ServiceAccount
+  name: custom-scheduler
+  namespace: default
+roleRef:
+  kind: ClusterRole
+  name: custom-scheduler
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# ConfigMap for Go scheduler code
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: simple-scheduler-code
+  namespace: default
+data:
+  simple-custom-scheduler.go: |
+    #include from 01-simple-custom-scheduler.go
+
+---
+# Deployment for Go-based scheduler
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: simple-custom-scheduler
+  namespace: default
+  labels:
+    app: simple-custom-scheduler
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: simple-custom-scheduler
+  template:
+    metadata:
+      labels:
+        app: simple-custom-scheduler
+    spec:
+      serviceAccountName: custom-scheduler
+      containers:
+      - name: scheduler
+        image: custom-scheduler-go:latest
+        # For local development, build with:
+        # docker build -f Dockerfile.go -t custom-scheduler-go .
+        command: ["/simple-custom-scheduler"]
+        args:
+        - --scheduler-name=simple-custom-scheduler
+        - --v=2
+        env:
+        - name: SCHEDULER_NAME
+          value: "simple-custom-scheduler"
+        - name: KUBECONFIG
+          value: "/etc/kubernetes/scheduler.conf"  # In-cluster config
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 10251
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 10251
+          initialDelaySeconds: 10
+          periodSeconds: 5
+
+---
+# Deployment for Python-based GPU scheduler
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gpu-aware-scheduler
+  namespace: default
+  labels:
+    app: gpu-aware-scheduler
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gpu-aware-scheduler
+  template:
+    metadata:
+      labels:
+        app: gpu-aware-scheduler
+    spec:
+      serviceAccountName: custom-scheduler
+      containers:
+      - name: scheduler
+        image: gpu-aware-scheduler-python:latest
+        # For local development, build with:
+        # docker build -f Dockerfile.python -t gpu-aware-scheduler-python .
+        command: ["python3", "-u", "gpu-aware-scheduler.py"]
+        env:
+        - name: SCHEDULER_NAME
+          value: "gpu-aware-scheduler"
+        - name: DCGM_ENDPOINT
+          value: "http://dcgm-exporter.default.svc:9400"
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        resources:
+          requests:
+            cpu: 200m
+            memory: 256Mi
+          limits:
+            cpu: 1000m
+            memory: 1Gi
+
+---
+# Example pod using the custom scheduler
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test-custom-scheduler
+  labels:
+    app: test
+spec:
+  # IMPORTANT: This tells Kubernetes to use our custom scheduler!
+  schedulerName: simple-custom-scheduler
+
+  containers:
+  - name: nginx
+    image: nginx:latest
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+
+---
+# Example GPU workload using GPU-aware scheduler
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test-gpu-scheduler
+  labels:
+    app: test-gpu
+spec:
+  schedulerName: gpu-aware-scheduler
+
+  nodeSelector:
+    gpu.node: "true"
+
+  containers:
+  - name: vllm
+    image: vllm/vllm-openai:latest
+    command: ["sleep", "3600"]
+    env:
+    - name: TENSOR_PARALLEL_SIZE
+      value: "4"
+    resources:
+      requests:
+        nvidia.com/gpu: "4"
+        memory: "32Gi"
+      limits:
+        nvidia.com/gpu: "4"
+        memory: "64Gi"
+
+---
+# Dockerfile.go - Build Go scheduler
+# Create this file separately as "Dockerfile.go"
+#
+# FROM golang:1.21-alpine AS builder
+# WORKDIR /app
+# COPY 01-simple-custom-scheduler.go .
+# RUN go mod init scheduler && \
+#     go get k8s.io/client-go@latest && \
+#     go build -o simple-custom-scheduler 01-simple-custom-scheduler.go
+#
+# FROM alpine:latest
+# RUN apk --no-cache add ca-certificates
+# WORKDIR /
+# COPY --from=builder /app/simple-custom-scheduler .
+# EXPOSE 10251
+# ENTRYPOINT ["/simple-custom-scheduler"]
+
+---
+# Dockerfile.python - Build Python scheduler
+# Create this file separately as "Dockerfile.python"
+#
+# FROM python:3.11-slim
+#
+# RUN apt-get update && \
+#     apt-get install -y --no-install-recommends \
+#     ca-certificates \
+#     && rm -rf /var/lib/apt/lists/*
+#
+# WORKDIR /app
+# COPY 02-gpu-aware-scheduler.py .
+# RUN pip install kubernetes prometheus-client networkx --no-cache-dir
+#
+# ENV PYTHONUNBUFFERED=1
+# ENTRYPOINT ["python3", "-u", "gpu-aware-scheduler.py"]
+
+---
+# How to Deploy:
+#
+# 1. Apply RBAC and ConfigMaps:
+#    kubectl apply -f 03-deploy-custom-scheduler.yaml
+#
+# 2. Build and push scheduler images:
+#    docker build -f Dockerfile.go -t your-registry/custom-scheduler-go:latest .
+#    docker build -f Dockerfile.python -t your-registry/gpu-aware-scheduler:latest .
+#    docker push your-registry/custom-scheduler-go:latest
+#    docker push your-registry/gpu-aware-scheduler:latest
+#
+# 3. Update image references in this file to use your registry
+#
+# 4. Apply again to deploy the schedulers:
+#    kubectl apply -f 03-deploy-custom-scheduler.yaml
+#
+# 5. Verify schedulers are running:
+#    kubectl get pods -l 'app in (simple-custom-scheduler,gpu-aware-scheduler)'
+#
+# 6. Check scheduler logs:
+#    kubectl logs -l app=simple-custom-scheduler --tail=20
+#    kubectl logs -l app=gpu-aware-scheduler --tail=20
+#
+# 7. Deploy test pods:
+#    kubectl apply -f 03-deploy-custom-scheduler.yaml
+#    kubectl get pod test-custom-scheduler
+#    kubectl get pod test-gpu-scheduler
+#
+# 8. Check which node the pod was scheduled to:
+#    kubectl get pod test-custom-scheduler -o wide
+#
+# Architecture:
+#
+# ┌─────────────────────────────────────────────────────────────────┐
+# │  Kubernetes Cluster                                             │
+# │  ┌───────────────────────────────────────────────────────────┐ │
+# │  │ kube-apiserver                                            │ │
+# │  │   ↓ Watches pods                                          │ │
+# │  │   ↓                                                      │ │
+# │  │ ┌─────────────────────────────────────────────────────┐ │ │
+# │  │ │ Custom Scheduler (Deployment)                        │ │ │
+# │  │ │ - Watches for unscheduled pods                      │ │ │
+# │  │ │ - Filters nodes                                      │ │ │
+# │  │ │ - Scores nodes                                       │ │ │
+# │  │ │ - Binds pods to nodes                                │ │ │
+# │  │ └─────────────────────────────────────────────────────┘ │ │
+# │  └───────────────────────────────────────────────────────────┘ │
+│                                                                  │
+│  Pod Flow:                                                       │
+│  ┌───────────────────────────────────────────────────────────┐ │
+│  │ 1. User creates pod with schedulerName="custom-scheduler"│ │
+│  │ 2. kube-apiserver accepts pod (phase: Pending)           │ │
+│  │ 3. Custom scheduler sees pod via watch API               │ │
+│  │ 4. Custom scheduler selects node                         │ │
+│  │ 5. Custom scheduler binds pod to node                    │ │
+│  │ 6. kubelet on that node starts the pod container         │ │
+│  └───────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────┘
+#
+# Key Points:
+#
+# 1. RBAC Permissions: Scheduler needs permission to:
+#    - Get/list/watch pods, nodes
+#    - Create/update pod bindings
+#    - Get/list/watch PVs, PVCs, storage classes
+#    - Create events
+#
+# 2. High Availability: Run 2+ replicas for HA
+#    - Only one replica schedules each pod (optimistic locking)
+#    - Other replicas take over if primary fails
+#
+# 3. Scheduler Name: Must match schedulerName in pod spec
+#    - kube-scheduler: "" or "default-scheduler"
+#    - Your scheduler: "simple-custom-scheduler"
+#
+# 4. Monitoring: Add health checks and metrics
+#    - /healthz endpoint for readiness
+#    - /metrics endpoint for Prometheus
+#    - Logging for debugging
+#
+# Comparison with kube-scheduler:
+#
+# ┌─────────────────────────────────────────────────────────────┐
+# │  kube-scheduler (default)                                   │
+# │  - Built-in plugins (NodeResourcesFit, etc.)               │
+# │  - Configured via ConfigMap                                │
+# │  - Runs as static pod in control plane                     │
+# └─────────────────────────────────────────────────────────────┘
+#
+# ┌─────────────────────────────────────────────────────────────┐
+# │  Your custom scheduler                                     │
+# │  - Your code, your logic                                   │
+# │  - Can integrate external metrics (DCGM, Prometheus)       │
+# │  - Runs as Deployment (can run anywhere)                  │
+# └─────────────────────────────────────────────────────────────┘

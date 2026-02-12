@@ -1,0 +1,130 @@
+# Strategy 2: Init Container Warm-up
+#
+# This deployment uses an init container to warm up the model
+# before the main container even starts.
+#
+# Benefit: Model is pre-loaded before pod is considered "Initialized"
+# Trade-off: Total pod startup time increases (init + main container)
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-init-container
+  labels:
+    app: vllm
+    warmup: "init-container"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vllm
+      warmup: "init-container"
+  template:
+    metadata:
+      labels:
+        app: vllm
+        warmup: "init-container"
+    spec:
+      # Init container runs before main container starts
+      initContainers:
+      - name: model-warmup
+        image: vllm-warmup-test:latest
+        imagePullPolicy: IfNotPresent
+        command: ["python", "-c"]
+        # This script:
+        # 1. Waits for the main vLLM server (in same pod, sidecar pattern)
+        #    Actually, we need a different approach for init containers
+        # 2. In real vLLM, you'd:
+        #    - Download models to shared volume
+        #    - Pre-load weights
+        #    - Initialize KV cache
+        #
+        # For this simulation, we'll just sleep to show the pattern
+        args:
+        - |
+          import time
+          import requests
+          import logging
+
+          logging.basicConfig(level=logging.INFO)
+          logger = logging.getLogger(__name__)
+
+          logger.info("Init container: Starting model warm-up...")
+
+          # In a real scenario, you would:
+          # 1. Download model weights to shared volume
+          # 2. Pre-process model files
+          # 3. Wait for main container to be healthy
+
+          # Simulate warm-up work
+          for i in range(10):
+              time.sleep(3)
+              logger.info(f"Warm-up progress: {(i+1)*10}%")
+
+          logger.info("Init container: Warm-up complete!")
+
+          # In production, you'd make a request to trigger model loading
+          # import requests
+          # while True:
+          #     try:
+          #         requests.get('http://localhost:8000/health')
+          #         break
+          #     except:
+          #         time.sleep(1)
+          # requests.post('http://localhost:8000/v1/completions', json={
+          #     'model': 'meta-llama/Llama-3-70B',
+          #     'prompt': 'Warm-up',
+          #     'max_tokens': 1
+          # })
+        env:
+        - name: PYTHONUNBUFFERED
+          value: "1"
+      containers:
+      - name: vllm
+        image: vllm-warmup-test:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8000
+          name: http
+        env:
+        - name: MODEL_NAME
+          value: "meta-llama/Llama-3-70B"
+        - name: MODEL_LOADING_TIME
+          value: "30"  # Simulated 30s loading time
+        - name: WARMUP_REQUEST_TIME
+          value: "1"
+        # Still use readiness probe to ensure model is loaded
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8000
+          initialDelaySeconds: 5
+          periodSeconds: 3
+          failureThreshold: 20
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 15
+          periodSeconds: 10
+          failureThreshold: 3
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "2Gi"
+          limits:
+            cpu: "2"
+            memory: "4Gi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-init-container
+spec:
+  selector:
+    app: vllm
+    warmup: "init-container"
+  ports:
+  - port: 80
+    targetPort: 8000
+  type: ClusterIP

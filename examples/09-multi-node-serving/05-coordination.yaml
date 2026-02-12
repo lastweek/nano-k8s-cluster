@@ -1,0 +1,644 @@
+# 05: Distributed Coordination
+#
+# This example adds coordination mechanisms for distributed systems:
+# - Leader election
+# - Configuration sharing
+# - Pod readiness coordination
+# - Graceful startup sequence
+#
+# What you'll learn:
+# - How pods coordinate startup WITHIN a model instance
+# - How to ensure all pods are ready before serving
+# - How to handle pod failures gracefully
+# - How to share configuration across pods
+
+---
+# ConfigMap with shared configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: llama-config
+data:
+  model.name: "meta-llama/Meta-Llama-3-70B"
+  model.tensor-parallel-size: "8"
+  model.block-size: "8"
+  serving.max-model-len: "4096"
+  serving.dtype: "half"
+  # Coordination settings
+  coord.startup.timeout: "300"  # 5 minutes to all be ready
+  coord.heartbeat.interval: "10"  # 10 seconds
+  coord.heartbeat.timeout: "30"  # 30 seconds
+
+---
+# ============================================
+# MODEL INSTANCE A
+# ============================================
+# Service for instance A coordination
+apiVersion: v1
+kind: Service
+metadata:
+  name: llama-70b-instance-a-coord
+  labels:
+    app: llama-70b
+    instance: a
+    component: backend
+spec:
+  clusterIP: None  # Headless
+  ports:
+  - name: coord
+    port: 9090
+    targetPort: 9090
+  - name: http
+    port: 8000
+    targetPort: 8000
+  - name: p2p
+    port: 5000
+    targetPort: 5000
+  selector:
+    app: llama-70b
+    instance: a
+
+---
+# StatefulSet for Instance A with coordination
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: llama-70b-instance-a
+  labels:
+    app: llama-70b
+    instance: a
+    component: backend
+spec:
+  serviceName: llama-70b-instance-a-coord
+  replicas: 2
+  podManagementPolicy: OrderedReady  # Start pods one by one
+  selector:
+    matchLabels:
+      app: llama-70b
+      instance: a
+  template:
+    metadata:
+      labels:
+        app: llama-70b
+        instance: a
+        component: backend
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values:
+                - llama-70b
+              - key: instance
+                operator: In
+                values:
+                - a
+            topologyKey: kubernetes.io/hostname
+      nodeSelector:
+        gpu.node: "true"
+
+      # Init container to wait for coordinator
+      initContainers:
+      - name: wait-coordinator
+        image: busybox:1.36
+        command:
+        - sh
+        - -c
+        - |
+          # Wait for coordinator (pod-0) to be ready
+          if [ "$HOSTNAME" != "llama-70b-instance-a-0" ]; then
+            echo "Waiting for coordinator (llama-70b-instance-a-0)..."
+            until nslookup llama-70b-instance-a-0.llama-70b-instance-a-coord.default.svc.cluster.local:9090; do
+              echo "Coordinator not ready, waiting..."
+              sleep 5
+            done
+            # Wait for coordinator to signal ready
+            until wget -q --spider --timeout=30 http://llama-70b-instance-a-0.llama-70b-instance-a-coord.default.svc.cluster.local:9090/ready; do
+              echo "Waiting for coordinator ready signal..."
+              sleep 5
+            done
+            echo "Coordinator ready!"
+          else
+            echo "I am the coordinator, skipping wait"
+          fi
+
+      containers:
+      # Sidecar for coordination
+      - name: coordinator-sidecar
+        image: busybox:1.36
+        command:
+        - sh
+        - -c
+        - |
+          #!/bin/sh
+          # Coordinator sidecar - manages pod coordination
+
+          POD_NAME=${HOSTNAME}
+          ORDINAL=${HOSTNAME##*-}
+
+          echo "Starting coordination sidecar for ${POD_NAME} (rank ${ORDINAL})..."
+
+          if [ "$ORDINAL" = "0" ]; then
+            # I am the coordinator!
+            echo "I am the coordinator"
+
+            # Start HTTP server for coordination signals
+            while true; do
+              # Check if all pods are registered
+              READY_PODS=0
+              for i in $(seq 0 $((REPLICAS-1))); do
+                if wget -q --spider --timeout=5 http://llama-70b-instance-a-${i}.llama-70b-instance-a-coord.default.svc.cluster.local:9090/heartbeat 2>/dev/null; then
+                  READY_PODS=$((READY_PODS + 1))
+                fi
+              done
+
+              if [ "$READY_PODS" = "$REPLICAS" ]; then
+                echo "All $REPLICAS pods ready!"
+                echo "200" > /tmp/ready
+
+                # Broadcast ready signal every 10 seconds
+                while true; do
+                  echo "Broadcasting ready signal..."
+                  sleep 10
+                done
+              else
+                echo "Waiting for pods: ${READY_PODS}/${REPLICAS}"
+                sleep 5
+              fi
+            done
+          else
+            # I am a worker
+            echo "I am a worker (rank ${ORDINAL})"
+
+            # Start heartbeat server
+            while true; do
+              # Signal heartbeat
+              echo "ok" > /tmp/heartbeat
+
+              # Check coordinator ready
+              if wget -q --spider --timeout=5 http://llama-70b-instance-a-0.llama-70b-instance-a-coord.default.svc.cluster.local:9090/ready 2>/dev/null; then
+                echo "Coordinator signaled ready, all systems go!"
+                break
+              fi
+
+              sleep 5
+            done
+
+            # Keep alive
+            while true; do
+              sleep 30
+            done
+          fi
+        env:
+        - name: REPLICAS
+          value: "2"
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        ports:
+        - name: coord
+          containerPort: 9090
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 9090
+          initialDelaySeconds: 5
+          periodSeconds: 10
+
+      # Main vLLM container
+      - name: vllm
+        image: vllm/vllm-openai:latest
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          POD_ORDINAL=$(echo $HOSTNAME | cut -d- -f3)
+          echo "Pod ordinal: $POD_ORDINAL"
+          export POD_ORDINAL
+          exec python -m vllm.entrypoints.openai.api_server \
+            --model=meta-llama/Meta-Llama-3-70B \
+            --tensor-parallel-size=8 \
+            --host=0.0.0.0 \
+            --port=8000
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: MASTER_ADDR
+          value: "llama-70b-instance-a-0.llama-70b-instance-a-coord.default.svc.cluster.local"
+        - name: MASTER_PORT
+          value: "5000"
+        - name: CUDA_VISIBLE_DEVICES
+          value: "0,1,2,3"
+        # Load config from ConfigMap
+        - name: MODEL_NAME
+          valueFrom:
+            configMapKeyRef:
+              name: llama-config
+              key: model.name
+        - name: TENSOR_PARALLEL_SIZE
+          valueFrom:
+            configMapKeyRef:
+              name: llama-config
+              key: model.tensor-parallel-size
+        ports:
+        - name: http
+          containerPort: 8000
+        - name: p2p
+          containerPort: 5000
+        - name: coord
+          containerPort: 9090
+        volumeMounts:
+        - name: shm
+          mountPath: /dev/shm
+        - name: config
+          mountPath: /config
+        resources:
+          requests:
+            nvidia.com/gpu: "4"
+            cpu: "16"
+            memory: "64Gi"
+          limits:
+            nvidia.com/gpu: "4"
+            memory: "128Gi"
+        # Only start when coordination sidecar signals ready
+        readinessProbe:
+          exec:
+            command:
+            - sh
+            - -c
+            - "wget -q --spider http://localhost:9090/ready || exit 1"
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          failureThreshold: 3
+        startupProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 60
+          periodSeconds: 10
+          failureThreshold: 60  # 10 minutes for full model loading
+      volumes:
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 16Gi
+      - name: config
+        configMap:
+          name: llama-config
+
+---
+# Service to expose Instance A (rank-0 only)
+apiVersion: v1
+kind: Service
+metadata:
+  name: llama-70b-instance-a
+  labels:
+    app: llama-70b
+    instance: a
+    component: backend
+spec:
+  type: ClusterIP
+  ports:
+  - name: http
+    port: 8000
+    targetPort: 8000
+  selector:
+    app: llama-70b
+    instance: a
+    component: backend
+
+---
+# ============================================
+# MODEL INSTANCE B
+# ============================================
+# Service for instance B coordination
+apiVersion: v1
+kind: Service
+metadata:
+  name: llama-70b-instance-b-coord
+  labels:
+    app: llama-70b
+    instance: b
+    component: backend
+spec:
+  clusterIP: None  # Headless
+  ports:
+  - name: coord
+    port: 9090
+    targetPort: 9090
+  - name: http
+    port: 8000
+    targetPort: 8000
+  - name: p2p
+    port: 5000
+    targetPort: 5000
+  selector:
+    app: llama-70b
+    instance: b
+
+---
+# StatefulSet for Instance B with coordination
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: llama-70b-instance-b
+  labels:
+    app: llama-70b
+    instance: b
+    component: backend
+spec:
+  serviceName: llama-70b-instance-b-coord
+  replicas: 2
+  podManagementPolicy: OrderedReady
+  selector:
+    matchLabels:
+      app: llama-70b
+      instance: b
+  template:
+    metadata:
+      labels:
+        app: llama-70b
+        instance: b
+        component: backend
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values:
+                - llama-70b
+              - key: instance
+                operator: In
+                values:
+                - b
+            topologyKey: kubernetes.io/hostname
+      nodeSelector:
+        gpu.node: "true"
+
+      initContainers:
+      - name: wait-coordinator
+        image: busybox:1.36
+        command:
+        - sh
+        - -c
+        - |
+          if [ "$HOSTNAME" != "llama-70b-instance-b-0" ]; then
+            echo "Waiting for coordinator (llama-70b-instance-b-0)..."
+            until nslookup llama-70b-instance-b-0.llama-70b-instance-b-coord.default.svc.cluster.local:9090; do
+              echo "Coordinator not ready, waiting..."
+              sleep 5
+            done
+            until wget -q --spider --timeout=30 http://llama-70b-instance-b-0.llama-70b-instance-b-coord.default.svc.cluster.local:9090/ready; do
+              echo "Waiting for coordinator ready signal..."
+              sleep 5
+            done
+            echo "Coordinator ready!"
+          else
+            echo "I am the coordinator, skipping wait"
+          fi
+
+      containers:
+      - name: coordinator-sidecar
+        image: busybox:1.36
+        command:
+        - sh
+        - -c
+        - |
+          #!/bin/sh
+          POD_NAME=${HOSTNAME}
+          ORDINAL=${HOSTNAME##*-}
+
+          echo "Starting coordination sidecar for ${POD_NAME} (rank ${ORDINAL})..."
+
+          if [ "$ORDINAL" = "0" ]; then
+            echo "I am the coordinator"
+            while true; do
+              READY_PODS=0
+              for i in $(seq 0 $((REPLICAS-1))); do
+                if wget -q --spider --timeout=5 http://llama-70b-instance-b-${i}.llama-70b-instance-b-coord.default.svc.cluster.local:9090/heartbeat 2>/dev/null; then
+                  READY_PODS=$((READY_PODS + 1))
+                fi
+              done
+              if [ "$READY_PODS" = "$REPLICAS" ]; then
+                echo "All $REPLICAS pods ready!"
+                echo "200" > /tmp/ready
+                while true; do
+                  echo "Broadcasting ready signal..."
+                  sleep 10
+                done
+              else
+                echo "Waiting for pods: ${READY_PODS}/${REPLICAS}"
+                sleep 5
+              fi
+            done
+          else
+            echo "I am a worker (rank ${ORDINAL})"
+            while true; do
+              echo "ok" > /tmp/heartbeat
+              if wget -q --spider --timeout=5 http://llama-70b-instance-b-0.llama-70b-instance-b-coord.default.svc.cluster.local:9090/ready 2>/dev/null; then
+                echo "Coordinator signaled ready, all systems go!"
+                break
+              fi
+              sleep 5
+            done
+            while true; do
+              sleep 30
+            done
+          fi
+        env:
+        - name: REPLICAS
+          value: "2"
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        ports:
+        - name: coord
+          containerPort: 9090
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 9090
+          initialDelaySeconds: 5
+          periodSeconds: 10
+
+      - name: vllm
+        image: vllm/vllm-openai:latest
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          POD_ORDINAL=$(echo $HOSTNAME | cut -d- -f3)
+          echo "Pod ordinal: $POD_ORDINAL"
+          export POD_ORDINAL
+          exec python -m vllm.entrypoints.openai.api_server \
+            --model=meta-llama/Meta-Llama-3-70B \
+            --tensor-parallel-size=8 \
+            --host=0.0.0.0 \
+            --port=8000
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: MASTER_ADDR
+          value: "llama-70b-instance-b-0.llama-70b-instance-b-coord.default.svc.cluster.local"
+        - name: MASTER_PORT
+          value: "5000"
+        - name: CUDA_VISIBLE_DEVICES
+          value: "0,1,2,3"
+        - name: MODEL_NAME
+          valueFrom:
+            configMapKeyRef:
+              name: llama-config
+              key: model.name
+        - name: TENSOR_PARALLEL_SIZE
+          valueFrom:
+            configMapKeyRef:
+              name: llama-config
+              key: model.tensor-parallel-size
+        ports:
+        - name: http
+          containerPort: 8000
+        - name: p2p
+          containerPort: 5000
+        - name: coord
+          containerPort: 9090
+        volumeMounts:
+        - name: shm
+          mountPath: /dev/shm
+        - name: config
+          mountPath: /config
+        resources:
+          requests:
+            nvidia.com/gpu: "4"
+            cpu: "16"
+            memory: "64Gi"
+          limits:
+            nvidia.com/gpu: "4"
+            memory: "128Gi"
+        readinessProbe:
+          exec:
+            command:
+            - sh
+            - -c
+            - "wget -q --spider http://localhost:9090/ready || exit 1"
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          failureThreshold: 3
+        startupProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 60
+          periodSeconds: 10
+          failureThreshold: 60
+      volumes:
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 16Gi
+      - name: config
+        configMap:
+          name: llama-config
+
+---
+# Service to expose Instance B (rank-0 only)
+apiVersion: v1
+kind: Service
+metadata:
+  name: llama-70b-instance-b
+  labels:
+    app: llama-70b
+    instance: b
+    component: backend
+spec:
+  type: ClusterIP
+  ports:
+  - name: http
+    port: 8000
+    targetPort: 8000
+  selector:
+    app: llama-70b
+    instance: b
+    component: backend
+
+# Coordination Patterns:
+#
+# ┌─────────────────────────────────────────────────────────────┐
+# |  Multi-Instance Architecture with Coordination                |
+# |  ┌───────────────────────────────────────────────────────┐  |
+# |  |                                                        |  |
+# |  |  Instance A                    Instance B              |  |
+# |  |  ┌─────────────────────┐      ┌─────────────────────┐ |  |
+# |  |  │Pod-A0 (rank 0)      │      │Pod-B0 (rank 0)      │ |  |
+# |  |  │Coordinator          │      │Coordinator          │ |  |
+# |  |  │Waits for A1         │      │Waits for B1         │ |  |
+# |  |  │Signals /ready       │      │Signals /ready       │ |  |
+# |  |  └─────────────────────┘      └─────────────────────┘ |  |
+# |  |         ↓                            ↓                 |  |
+# |  |  ┌─────────────────────┐      ┌─────────────────────┐ |  |
+# |  |  │Pod-A1 (rank 1)      │      │Pod-B1 (rank 1)      │ |  |
+# |  |  │Worker               │      │Worker               │ |  |
+# |  |  │Waits for /ready     │      │Waits for /ready     │ |  |
+# |  |  │Connects to A0       │      │Connects to B0       │ |  |
+# |  |  └─────────────────────┘      └─────────────────────┘ |  |
+# |  |         │                            │                 |  |
+# |  |    TP=8 (2×4 GPUs)              TP=8 (2×4 GPUs)        |  |
+# |  |                                                        |  |
+# |  |  Each instance coordinates independently!              |  |
+# |  └───────────────────────────────────────────────────────┘  |
+# └─────────────────────────────────────────────────────────────┘
+#
+# Coordination Sidecar Responsibilities:
+#
+# ┌─────────────────────────────────────────────────────────────┐
+# |  Coordinator (Pod-0) - WITHIN EACH INSTANCE                   |
+# |  ┌───────────────────────────────────────────────────────┐  |
+# |  | 1. Start HTTP server on :9090                          |  |
+# |  | 2. Monitor /heartbeat from all workers IN THIS INSTANCE|  |
+# |  | 3. When all workers registered:                        |  |
+# |  |    → Create /ready file                                |  |
+# |  |    → HTTP /ready returns 200                            |  |
+# |  | 4. Broadcast ready every 10 seconds                    |  |
+# |  └───────────────────────────────────────────────────────┘  |
+# |                                                                |
+# |  Workers (Pod-1, Pod-2, ...) - WITHIN EACH INSTANCE            |
+# |  ┌───────────────────────────────────────────────────────┐  |
+# |  | 1. Start HTTP server on :9090                          |  |
+# |  | 2. Send /heartbeat every 5 seconds                      |  |
+# |  | 3. Poll coordinator /ready every 5 seconds              |  |
+# |  | 4. When /ready returns 200:                             |  |
+# |  |    → Signal main container to start                     |  |
+# |  |    → Connect to coordinator (rank-0)                    |  |
+# |  └───────────────────────────────────────────────────────┘  |
+# └─────────────────────────────────────────────────────────────┘
+#
+# Testing:
+#
+# 1. Apply:
+#    kubectl apply -f 05-coordination.yaml
+#
+# 2. Watch startup sequence for both instances:
+#    kubectl get pods -w -l app=llama-70b
+#
+# 3. Check coordination for instance A:
+#    kubectl exec llama-70b-instance-a-0 -c coordinator-sidecar -- cat /tmp/ready
+#
+# 4. Check coordination for instance B:
+#    kubectl exec llama-70b-instance-b-0 -c coordinator-sidecar -- cat /tmp/ready
+#
+# 5. Test coordination signals:
+#    kubectl exec llama-70b-instance-a-1 -c coordinator-sidecar -- \
+#      wget -qO- http://llama-70b-instance-a-0.llama-70b-instance-a-coord:9090/ready
+#
+# 6. Delete pod-1 from instance A and watch recovery:
+#    kubectl delete pod llama-70b-instance-a-1
+#    # Watch new pod-1 coordinate with pod-0

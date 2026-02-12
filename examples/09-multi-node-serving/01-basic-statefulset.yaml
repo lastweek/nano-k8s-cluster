@@ -1,0 +1,183 @@
+# 01: Basic StatefulSet
+#
+# This is the simplest multi-node serving example.
+# It shows how a StatefulSet differs from a Deployment.
+#
+# What you'll learn:
+# - What is a StatefulSet
+# - Stable pod identities (pod-0, pod-1, pod-2)
+# - Ordered deployment (pods start one by one)
+# - Stable network identities
+#
+# StatefulSet vs Deployment:
+#
+# ┌─────────────────────────────────────────────────────────────┐
+# │  Deployment (Stateless)                                     │
+# │  ┌───────────────────────────────────────────────────────┐ │
+# │  │ nginx-deploy-7d6f8b9c-xkp2z  → Random hash           │ │
+# │  │ nginx-deploy-7d6f8b9c-mn5qp  → Unpredictable         │ │
+# │  │ nginx-deploy-7d6f8b9c-zkl4q  → No stable identity    │ │
+# │  │                                                       │ │
+# │  │ If pod dies:                                          │ │
+# │  │   New pod gets random name: nginx-deploy-abc123       │ │
+# │  └───────────────────────────────────────────────────────┘ │
+│  Use case: Web servers, APIs (stateless)                      │
+└─────────────────────────────────────────────────────────────┘
+#                           │
+#                           ▼
+# ┌─────────────────────────────────────────────────────────────┐
+# │  StatefulSet (Stateful)                                      │
+# │  ┌───────────────────────────────────────────────────────┐ │
+# │  │ llama-3-8b-0              → Ordinal index!           │ │
+# │  │ llama-3-8b-1              → Predictable name         │ │
+# │  │ llama-3-8b-2              → Stable identity          │ │
+# │  │                                                       │ │
+# │  │ If pod-1 dies:                                        │ │
+# │  │   New pod keeps name: llama-3-8b-1                   │ │
+# │  │   Keeps same PVC, same network identity               │ │
+# │  └───────────────────────────────────────────────────────┘ │
+│  Use case: Databases, distributed systems, multi-node LLMs     │
+└─────────────────────────────────────────────────────────────┘
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: llama-3-8b
+  labels:
+    app: llama-3-8b
+spec:
+  # Regular ClusterIP service (not headless yet)
+  # We'll make it headless in example 02
+  clusterIP: None  # Headless (each pod gets own DNS)
+  ports:
+  - name: http
+    port: 8000
+    targetPort: 8000
+  selector:
+    app: llama-3-8b
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: llama-3-8b
+  labels:
+    app: llama-3-8b
+spec:
+  serviceName: llama-3-8b  # Headless service name
+  replicas: 3
+  selector:
+    matchLabels:
+      app: llama-3-8b
+  template:
+    metadata:
+      labels:
+        app: llama-3-8b
+    spec:
+      containers:
+      - name: vllm
+        image: vllm/vllm-openai:latest
+        command: ["python", "-m", "vllm.entrypoints.openai.api_server"]
+        args:
+        - --model=meta-llama/Meta-Llama-3-8B
+        - --host=0.0.0.0
+        - --port=8000
+        - --tensor-parallel-size=1
+        ports:
+        - name: http
+          containerPort: 8000
+        resources:
+          requests:
+            cpu: "2"
+            memory: "8Gi"
+          limits:
+            cpu: "4"
+            memory: "16Gi"
+        # Probe to check if vLLM is ready
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 60
+          periodSeconds: 30
+
+# What Happens When You Apply This:
+#
+# 1. StatefulSet controller creates pods in order:
+#    → llama-3-8b-0 starts
+#    → Wait for pod-0 to be Ready
+#    → llama-3-8b-1 starts
+#    → Wait for pod-1 to be Ready
+#    → llama-3-8b-2 starts
+#    → Wait for pod-2 to be Ready
+#
+# 2. Each pod gets:
+#    - Stable hostname: llama-3-8b-{0,1,2}
+#    - Stable DNS: llama-3-8b-0.llama-3-8b.default.svc.cluster.local
+#    - (If we had PVCs) Stable storage: llama-3-8b-0-pvc
+#
+# 3. Pods can communicate:
+#    pod-0 → pod-1: http://llama-3-8b-1.llama-3-8b:8000
+#    pod-1 → pod-0: http://llama-3-8b-0.llama-3-8b:8000
+#
+# Key Differences from Deployment:
+#
+# ┌─────────────────────────────────────────────────────────────┐
+# │  Feature              │ Deployment    │ StatefulSet        │
+# ├─────────────────────────────────────────────────────────────┤
+# │  Pod names           │ Random hash   │ Stable ordinal     │
+# │  Startup order       │ Parallel      │ Sequential          │
+# │  Network identity    │ Changes       │ Stable             │
+# │  Storage             │ Ephemeral     │ Stable PVCs        │
+# │  Scaling down        │ Any pod       │ Highest ordinal    │
+# │  Use case            │ Stateless     │ Stateful           │
+# └─────────────────────────────────────────────────────────────┘
+#
+# Testing:
+#
+# 1. Apply:
+#    kubectl apply -f 01-basic-statefulset.yaml
+#
+# 2. Watch pods come up one by one:
+#    kubectl get pods -w -l app=llama-3-8b
+#
+# 3. Notice the startup order:
+#    → llama-3-8b-0 starts first
+#    → Waits for Ready
+#    → Then llama-3-8b-1 starts
+#    → Waits for Ready
+#    → Then llama-3-8b-2 starts
+#
+# 4. Check pod names are stable:
+#    kubectl get pods -l app=llama-3-8b
+#
+# 5. Delete a pod:
+#    kubectl delete pod llama-3-8b-1
+#
+# 6. New pod will have SAME NAME:
+#    kubectl get pods -l app=llama-3-8b
+#    → llama-3-8b-1 is recreated with same name!
+#
+# 7. Test DNS (from a test pod):
+#    kubectl run test --image=nicolaka/netshoot --rm -it -- bash
+#    # Inside pod:
+#    nslookup llama-3-8b-0.llama-3-8b.default.svc.cluster.local
+#    nslookup llama-3-8b-1.llama-3-8b.default.svc.cluster.local
+#    nslookup llama-3-8b-2.llama-3-8b.default.svc.cluster.local
+#
+# Why This Matters for Multi-Node LLMs:
+#
+# For distributed inference, pods need to:
+# 1. Know each other's addresses (stable DNS)
+# 2. Know their rank/position (ordinal index)
+# 3. Start in order (coordinator first, then workers)
+# 4. Maintain identity if restarted (same PVC, same rank)
+#
+# StatefulSet provides ALL of this!

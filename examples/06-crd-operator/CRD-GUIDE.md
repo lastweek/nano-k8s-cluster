@@ -1,50 +1,25 @@
-# CRDs and Operators
+# CRD Deep Dive Guide
 
-> A comprehensive guide to understanding Custom Resource Definitions and Operators - the pattern used by NVIDIA Dynamo and other advanced Kubernetes platforms.
+> A clear, step-by-step guide to understanding Custom Resource Definitions and how they create containers.
 
 ---
 
 ## Table of Contents
 
-1. [The Big Question](#the-big-question-how-do-crds-create-containers)
-2. [Prerequisites](#prerequisites)
-3. [The Three Layers](#understanding-the-three-layers)
-4. [Examples](#examples)
-5. [Step-by-Step Walkthrough](#step-by-step-from-crd-to-running-container)
-6. [The Reconciliation Loop](#the-reconciliation-loop)
-7. [Common Commands](#common-commands)
-8. [Real-World Examples](#real-world-examples)
-9. [Common Confusions Clarified](#common-confusions-clarified)
-10. [Building Your Own Operator](#building-your-own-operator)
-11. [Best Practices](#best-practices)
-12. [Troubleshooting](#troubleshooting)
-13. [References](#references)
+1. [The Big Question: How do CRDs create containers?](#the-big-question)
+2. [Understanding the Three Layers](#understanding-the-three-layers)
+3. [Step-by-Step: From CRD to Running Container](#step-by-step-from-crd-to-running-container)
+4. [The Reconciliation Loop Explained](#the-reconciliation-loop-explained)
+5. [Practical Examples](#practical-examples)
+6. [Common Confusions Clarified](#common-confusions-clarified)
 
 ---
 
 ## The Big Question: How do CRDs create containers?
 
-**Short answer**: CRDs do **NOT** create containers directly.
+**Short answer**: CRDs do NOT create containers directly.
 
 **Long answer**: A CRD defines a custom API resource. An **Operator** (controller) watches that resource and creates the actual containers (via Deployments, StatefulSets, etc.).
-
-```
-┌──────────────┐     ┌──────────────┐     ┌──────────────┐
-│   CRD        │  →  │  Instance    │  →  │  Operator    │
-│ (Definition) │     │   (Your YAML)│     │ (Makes it    │
-│              │     │              │     │   happen)    │
-└──────────────┘     └──────────────┘     └──────────────┘
-     Schema               Data                  Code
-   (No action)         (No action)          (Creates pods!)
-```
-
----
-
-## Prerequisites
-
-- Kubernetes cluster running (minikube, kind, or k3s)
-- kubectl configured and working
-- Completed all previous sections (Pods, Deployments, Services, StatefulSets)
 
 ---
 
@@ -62,8 +37,6 @@ Think of CRDs + Operators as a three-layer system:
 │ - Lives in Kubernetes API (you can kubectl get it)               │
 │ - Stored in etcd                                                 │
 │ - DOES NOT RUN ANYTHING                                          │
-│                                                                  │
-│ Like: Class definition in programming                            │
 └─────────────────────────────────────────────────────────────────┘
                            │
                            │ When you create an instance...
@@ -77,8 +50,6 @@ Think of CRDs + Operators as a three-layer system:
 │ - YAML file you write and apply                                  │
 │ - Contains your desired state                                    │
 │ - STILL DOES NOT RUN ANYTHING                                    │
-│                                                                  │
-│ Like: Object instance created from a class                       │
 └─────────────────────────────────────────────────────────────────┘
                            │
                            │ Operator notices and takes action...
@@ -92,8 +63,6 @@ Think of CRDs + Operators as a three-layer system:
 │ - Creates/updates actual Kubernetes resources                    │
 │ - THIS IS WHERE CONTAINERS GET CREATED                           │
 │ - Runs as a Deployment itself                                    │
-│                                                                  │
-│ Like: Method that implements the logic                           │
 └─────────────────────────────────────────────────────────────────┘
                            │
                            ▼
@@ -105,54 +74,6 @@ Think of CRDs + Operators as a three-layer system:
 │ - Containers in pods (running your model)                        │
 └─────────────────────────────────────────────────────────────────┘
 ```
-
----
-
-## Examples
-
-### 01: What is a CRD?
-
-**File**: [`01-what-is-crd.yaml`](01-what-is-crd.yaml)
-
-**What you'll learn**:
-- How to define a custom resource (LLMModel)
-- CRD schema and validation
-- Using kubectl with custom resources
-- **CRD alone doesn't DO anything** (need operator)
-
-**Run it**:
-```bash
-./01-test-crd.sh
-```
-
-**Key concepts**:
-- CRD extends Kubernetes API
-- Define schema with OpenAPI v3
-- Use kubectl to manage custom resources
-- CRD is just the definition (like a class)
-
----
-
-### 02: Simple Operator
-
-**File**: [`02-simple-operator.yaml`](02-simple-operator.yaml)
-
-**What you'll learn**:
-- Operator watches custom resources
-- Reconciliation loop in action
-- Creates deployments from LLMModel specs
-- Updates status based on actual state
-
-**Run it**:
-```bash
-./02-test-operator.sh
-```
-
-**Key concepts**:
-- Controller watches resources (via Kubernetes watch API)
-- Reconciliation: desired vs actual state
-- Operator creates/updates deployments automatically
-- Status updated continuously
 
 ---
 
@@ -194,7 +115,6 @@ spec:
 **Command**:
 ```bash
 kubectl apply -f 01-what-is-crd.yaml
-kubectl get crds
 ```
 
 **What happened**:
@@ -243,7 +163,7 @@ kubectl get llmmodels
 
 ### Step 3: Deploy the Operator (The Engine)
 
-**File**: [`02-simple-operator.yaml`](02-simple-operator.yaml)
+**File**: `02-simple-operator.yaml`
 
 The operator is a **Deployment that runs code watching for LLMModel resources**:
 
@@ -260,7 +180,7 @@ spec:
       - name: operator
         image: python:3.11-slim
         # The operator code runs here!
-        command: ["/bin/sh", "-c", "python /operator/operator.py"]
+        command: ["/bin/sh", "-c", "python /tmp/operator.py"]
 ```
 
 **What this does**:
@@ -305,7 +225,7 @@ def reconcile_llmmodel(llmmodel):
                 'spec': {
                     'containers': [{
                         'name': 'model',
-                        'image': 'vllm/vllm-openai:latest',  # Container image!
+                        'image': 'vllm/vllm-openai:latest',  # <-- CONTAINER IMAGE!
                         'env': [
                             {'name': 'MODEL_NAME', 'value': 'llama-3-70b'}
                         ]
@@ -353,7 +273,7 @@ kubectl get pods
 
 ---
 
-## The Reconciliation Loop
+## The Reconciliation Loop Explained
 
 The operator runs in a continuous loop:
 
@@ -419,145 +339,90 @@ The operator runs in a continuous loop:
 2. **Detect**: When a change happens (create/update/delete), the operator is notified
 3. **Read**: The operator reads the LLMModel spec (what you want)
 4. **Check**: The operator checks what actually exists (Deployments, pods)
-5. **Compare**: If what exists ≠ what you want, the operator takes action
+5. **Compare**: If what exists != what you want, the operator takes action
 6. **Act**: Create/update/delete resources to match your desired state
 7. **Repeat**: Forever (or until the operator stops)
 
-**The Control Loop in Code**:
-
-```python
-while True:
-    desired = get_llmmodel_spec()      # What you want
-    actual = get_deployment_status()    # What exists
-
-    if desired != actual:
-        reconcile()                     # Fix it!
-
-    sleep()
-```
-
 ---
 
-## Common Commands
+## Practical Examples
 
-### CRD Commands
-
-```bash
-# List CRDs
-kubectl get crds
-
-# Describe CRD
-kubectl describe crd <crd-name>
-
-# Get CRD YAML
-kubectl get crd <crd-name> -o yaml
-
-# Delete CRD (also deletes all instances!)
-kubectl delete crd <crd-name>
-```
-
-### Custom Resource Commands
+### Example 1: Creating a New Model
 
 ```bash
-# List custom resources
-kubectl get llmmodels
-kubectl get llm  # using short name
-
-# Describe custom resource
-kubectl describe llmmodel <name>
-
-# Get YAML
-kubectl get llmmodel <name> -o yaml
-
-# Create from file
-kubectl apply -f my-llm-model.yaml
-
-# Edit resource
-kubectl edit llmmodel <name>
-
-# Delete resource
-kubectl delete llmmodel <name>
-```
-
-### Testing the Operator
-
-```bash
-# Scale up
-kubectl patch llmmodel my-model -p '{"spec":{"replicas":5}}'
-
-# Watch the operator logs
-kubectl logs -l app=llm-operator -f
-
-# See what the operator created
-kubectl get deployment llmmodel-my-model
-kubectl get pods -l llmmodel=my-model
-```
-
----
-
-## Real-World Examples
-
-### Cert-Manager
-
-```yaml
-apiVersion: cert-manager.io/v1
-kind: Certificate
+# You create an LLMModel
+kubectl apply -f - <<EOF
+apiVersion: ai.example.com/v1
+kind: LLMModel
 metadata:
-  name: my-cert
+  name: my-new-model
 spec:
-  secretName: my-tls-cert
-  issuerRef:
-    name: letsencrypt-prod
-  dnsNames:
-  - api.example.com
-
-# Operator automatically:
-# - Requests certificate from Let's Encrypt
-# - Creates secret with certificate
-# - Renews before expiry
-```
-
-### Prometheus Operator
-
-```yaml
-apiVersion: monitoring.coreos.com/v1
-kind: Prometheus
-metadata:
-  name: prometheus
-spec:
+  modelName: llama-3-8b
   replicas: 2
-  resources:
-    requests:
-      memory: 400Mi
-
-# Operator automatically:
-# - Deploys Prometheus
-# - Configures scrape targets
-# - Manages storage
+  gpuType: A100
+EOF
 ```
 
-### NVIDIA Dynamo
+**What happens behind the scenes**:
 
-```yaml
-apiVersion: nvidia.com/v1
-kind: DynamoGraphDeployment
-metadata:
-  name: llama-3-70b
-spec:
-  sla:
-    max_latency_ms: 100
-    min_throughput: 50
-  model:
-    name: llama-3-70b
-    placement:
-      tensor_parallel_size: 4
-      gpu_type: H100
+1. Kubernetes stores the LLMModel in etcd
+2. Operator receives `ADDED` event via watch API
+3. Operator's `reconcile_llmmodel()` is called
+4. Operator sees no Deployment exists for `my-new-model`
+5. Operator creates Deployment with 2 replicas
+6. Deployment creates 2 pods
+7. Each pod runs a container with the llama-3-8b model
 
-# Operator automatically:
-# - Deploys model across GPUs
-# - Scales based on SLA
-# - Manages model lifecycle
+**Timeline**:
 ```
+t=0s    You apply LLMModel
+t=1s    Kubernetes stores it
+t=2s    Operator receives ADDED event
+t=3s    Operator creates Deployment
+t=10s   Pods are created and scheduled
+t=30s   Containers pull images and start
+t=60s   Model is ready to serve requests
+```
+
+---
+
+### Example 2: Scaling Up
+
+```bash
+# You change replicas from 2 to 5
+kubectl patch llmmodel my-new-model --type=json \
+  -p='[{"op": "replace", "path": "/spec/replicas", "value":5}]'
+```
+
+**What happens behind the scenes**:
+
+1. Kubernetes updates LLMModel in etcd
+2. Operator receives `MODIFIED` event via watch API
+3. Operator's `reconcile_llmmodel()` is called
+4. Operator reads spec: replicas=5
+5. Operator reads actual Deployment: replicas=2
+6. Operator patches Deployment to replicas=5
+7. Deployment creates 3 more pods
+8. New pods start containers
+
+**No manual intervention needed!**
+
+---
+
+### Example 3: Deleting a Model
+
+```bash
+kubectl delete llmmodel my-new-model
+```
+
+**What happens behind the scenes**:
+
+1. Kubernetes deletes LLMModel from etcd
+2. Operator receives `DELETED` event via watch API
+3. Operator's cleanup code runs
+4. Operator deletes the Deployment
+5. Deployment deletes all pods
+6. All containers are stopped
 
 ---
 
@@ -599,7 +464,7 @@ spec:
 **Wrong**: Operators must be written in Go.
 
 **Right**: Operators can be written in any language:
-- Python (using `kubernetes` Python client) - used in our examples
+- Python (using `kubernetes` Python client)
 - Go (using `controller-runtime`)
 - Java (using Fabric8)
 - Bash (using kubectl in a loop!)
@@ -618,7 +483,6 @@ spec:
 - Validation of user inputs
 
 **Simple example**:
-
 ```yaml
 # Instead of:
 apiVersion: apps/v1
@@ -652,205 +516,6 @@ The CRD version is simpler and hides complexity!
 
 ---
 
-## Building Your Own Operator
-
-### Step 1: Define CRD
-
-```yaml
-apiVersion: apiextensions.k8s.io/v1
-kind: CustomResourceDefinition
-metadata:
-  name: myresources.example.com
-spec:
-  group: example.com
-  names:
-    kind: MyResource
-  versions:
-  - name: v1
-    schema:
-      openAPIV3Schema:
-        # Your schema here
-```
-
-### Step 2: Write Controller
-
-```python
-from kubernetes import client, config
-from kubernetes.watch import Watch
-
-def reconcile(resource):
-    # Get desired state from resource spec
-    # Get actual state from cluster
-    # Make them match
-
-def watch():
-    w = Watch()
-    for event in w.stream(...):
-        reconcile(event['object'])
-```
-
-### Step 3: Deploy Operator
-
-```yaml
-apiVersion: apps/v1
-kind: Deployment
-spec:
-  template:
-    spec:
-      containers:
-      - name: operator
-        image: my-operator:latest
-```
-
-### Operator Frameworks
-
-Instead of writing from scratch, use:
-- **Kubebuilder** - https://book.kubebuilder.io/
-- **Operator SDK** - https://sdk.operatorframework.io/
-- **KUDO** - https://kudo.dev/
-
-These generate boilerplate and handle:
-- Watch API
-- Reconciliation loop
-- CRD generation
-- RBAC setup
-
----
-
-## Best Practices
-
-1. **Idempotent** - Reconcile should be safe to run multiple times
-2. **Finalizers** - Use for cleanup before deletion
-3. **Status** - Update status, don't modify spec
-4. **Logging** - Log reconciliation decisions
-5. **Metrics** - Expose Prometheus metrics
-6. **Labels** - Use labels for owner references
-7. **RBAC** - Principle of least privilege
-8. **Testing** - Test with envtest
-
----
-
-## Troubleshooting
-
-### Operator not creating resources
-
-```bash
-# Check operator is running
-kubectl get pods -l app=llm-operator
-
-# Check operator logs
-kubectl logs -l app=llm-operator
-
-# Check RBAC
-kubectl auth can-i create deployments --as=system:serviceaccount:default:llm-operator
-
-# Describe custom resource
-kubectl describe llmmodel my-model
-```
-
-### Status not updating
-
-```bash
-# Check operator has permission for /status
-kubectl get role llm-operator -o yaml
-
-# Check if status subresource is enabled
-kubectl get crd llmmodels.ai.example.com -o jsonpath='{.spec.versions[0].subresources}'
-```
-
-### Reconciliation loop stuck
-
-```bash
-# Check operator logs for errors
-kubectl logs -l app=llm-operator --tail=100
-
-# Check events
-kubectl get events --sort-by='.lastTimestamp' | tail -20
-
-# Enable debug logging
-kubectl set env deployment/llm-operator LOG_LEVEL=debug
-```
-
----
-
-## Running All Examples
-
-Run all CRD and Operator examples sequentially:
-
-```bash
-./test-all-crd-operator.sh
-```
-
-## Cleanup
-
-Clean up all CRD and Operator examples:
-
-```bash
-./cleanup-all-crd-operator.sh
-```
-
----
-
-## CRD vs Operator
-
-| Aspect | CRD | Operator |
-|--------|-----|----------|
-| **Purpose** | Define custom API | Watch and reconcile |
-| **Like** | Class in OOP | Instance method in OOP |
-| **Does it DO anything?** | No (just schema) | Yes (takes action) |
-| **Example** | LLMModel definition | Creates deployments |
-| **Together** | API specification | Automation logic |
-
----
-
-## Architecture: Operator in LLM Serving
-
-```
-┌───────────────────────────────────────────────────────────┐
-│                    User (kubectl apply)                   │
-└───────────────────────────┬───────────────────────────────┘
-                            │
-                            ▼
-┌───────────────────────────────────────────────────────────┐
-│  CRD: ModelDeployment                                     │
-│  ┌─────────────────────────────────────────────────────┐  │
-│  │ spec:                                                │  │
-│  │   model: llama-3-70b                                │  │
-│  │   replicas: 4                                       │  │
-│  │   sla.maxLatency: 100ms                             │  │
-│  └─────────────────────────────────────────────────────┘  │
-└───────────────────────────┬───────────────────────────────┘
-                            │
-                            ▼
-┌───────────────────────────────────────────────────────────┐
-│  ModelDeployment Operator                                 │
-│  ┌─────────────────────────────────────────────────────┐  │
-│  │ Reconciliation Loop:                                 │  │
-│  │ 1. Read ModelDeployment spec                        │  │
-│  │ 2. Calculate needed replicas (based on SLA)        │  │
-│  │ 3. Create/Update StatefulSet (for stable identity)│  │
-│  │ 4. Create Service for discovery                     │  │
-│  │ 5. Create HPA for autoscaling                       │  │
-│  │ 6. Update status                                    │  │
-│  └─────────────────────────────────────────────────────┘  │
-└───────────────────────────┬───────────────────────────────┘
-                            │
-                            ▼
-┌───────────────────────────────────────────────────────────┐
-│  Kubernetes Resources (Managed by Operator)               │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐ │
-│  │StatefulSet│  │ Service  │  │   HPA    │  │ ConfigMap│ │
-│  └──────────┘  └──────────┘  └──────────┘  └──────────┘ │
-│         │
-│         ▼
-│  ┌─────────────────────────────────────────────────────┐
-│  │ Pods (llama-3-70b-0, llama-3-70b-1, ...)          │
-│  └─────────────────────────────────────────────────────┘
-└───────────────────────────────────────────────────────────┘
-```
-
----
-
 ## Key Takeaways
 
 1. **CRD = API Definition**: Defines what fields exist, validation rules, names
@@ -876,36 +541,29 @@ Pods run Containers
 
 ---
 
-## Next Steps
-
-After mastering CRDs and Operators:
-1. **Kubebuilder** - Scaffold operators quickly
-2. **Operator Patterns** - Advanced reconciliation patterns
-3. **Helm Charts** - Package your operators
-4. **OAM** - Open Application Model
-5. **Building a production operator** - Monitoring, metrics, testing
-
----
-
-## References
-
-- [Kubernetes CRD Documentation](https://kubernetes.io/docs/tasks/access-kubernetes-api/custom-resources/custom-resource-definitions/)
-- [Kubebuilder Book](https://book.kubebuilder.io/)
-- [Operator SDK](https://sdk.operatorframework.io/)
-- [Operator Patterns](https://github.com/operator-framework/patterns)
-- [Kubernetes Controller Concepts](https://kubernetes.io/docs/concepts/architecture/controller/)
-- [NVIDIA Blog on Operators](https://developer.nvidia.com/blog/)
-
----
-
-## Files in This Directory
+## Related Files in This Directory
 
 | File | Purpose |
 |------|---------|
-| [`01-what-is-crd.yaml`](01-what-is-crd.yaml) | CRD definition (Layer 1) |
-| [`02-simple-operator.yaml`](02-simple-operator.yaml) | Operator deployment + code (Layer 3) |
-| [`operator.py`](operator.py) | Standalone operator Python code |
-| [`01-test-crd.sh`](01-test-crd.sh) | Test script for CRD only |
-| [`02-test-operator.sh`](02-test-operator.sh) | Test script for full operator |
-| [`test-all-crd-operator.sh`](test-all-crd-operator.sh) | Run all examples |
-| [`cleanup-all-crd-operator.sh`](cleanup-all-crd-operator.sh) | Clean up all resources |
+| `01-what-is-crd.yaml` | CRD definition (Layer 1) |
+| `02-simple-operator.yaml` | Operator deployment + code (Layer 3) |
+| `01-test-crd.sh` | Test script for CRD only |
+| `02-test-operator.sh` | Test script for full operator |
+| `README.md` | Overview and examples |
+
+---
+
+## Next Steps
+
+1. **Try it yourself**: Run `./01-test-crd.sh` to see CRD without operator
+2. **Add the operator**: Run `./02-test-operator.sh` to see full flow
+3. **Watch logs**: `kubectl logs -l app=llm-operator -f` to see reconciliation
+4. **Experiment**: Create your own LLMModel and watch what happens
+
+---
+
+## Further Reading
+
+- [Kubernetes CRD Documentation](https://kubernetes.io/docs/concepts/extend-kubernetes/api-extension/custom-resources/)
+- [Kubebuilder Book](https://book.kubebuilder.io/)
+- [Operator Pattern Guide](https://kubernetes.io/docs/concepts/architecture/controller/)

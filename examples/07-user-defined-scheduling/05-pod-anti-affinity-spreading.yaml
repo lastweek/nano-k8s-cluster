@@ -1,0 +1,414 @@
+# Pod Anti-Affinity for Spreading Example
+#
+# This example demonstrates how to use pod anti-affinity to spread pods
+# across different nodes. This is useful for:
+# - High availability (spread across failure domains)
+# - Load distribution across nodes
+# - Avoiding single points of failure
+# - Maximizing resource utilization
+#
+# What you'll learn:
+# - How to use podAntiAffinity for spreading
+# - Hard vs soft anti-affinity requirements
+# - Zone-aware spreading for disaster recovery
+
+---
+# Example 1: Spread pods across different nodes (high availability)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: model-server-ha
+  labels:
+    app: model-server-ha
+spec:
+  replicas: 5
+  selector:
+    matchLabels:
+      app: model-server-ha
+  template:
+    metadata:
+      labels:
+        app: model-server-ha
+    spec:
+      # Spread pods across DIFFERENT nodes
+      affinity:
+        podAntiAffinity:
+          # HARD requirement - must be on different nodes
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values:
+                - model-server-ha
+            topologyKey: kubernetes.io/hostname
+
+      containers:
+      - name: vllm
+        image: vllm/vllm-openai:latest
+        command: ["python", "-m", "vllm.entrypoints.openai.api_server"]
+        args:
+        - --model=meta-llama/Meta-Llama-3-8B
+        - --host=0.0.0.0
+        - --port=8000
+        ports:
+        - name: http
+          containerPort: 8000
+        resources:
+          requests:
+            nvidia.com/gpu: "1"
+            cpu: "2"
+            memory: "16Gi"
+          limits:
+            nvidia.com/gpu: "1"
+            cpu: "4"
+            memory: "32Gi"
+
+---
+# Example 2: Spread across zones (disaster recovery)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: model-server-multi-zone
+  labels:
+    app: model-server-multi-zone
+spec:
+  replicas: 6
+  selector:
+    matchLabels:
+      app: model-server-multi-zone
+  template:
+    metadata:
+      labels:
+        app: model-server-multi-zone
+    spec:
+      # Spread pods across different zones
+      affinity:
+        podAntiAffinity:
+          # HARD requirement - must be in different zones
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values:
+                - model-server-multi-zone
+            topologyKey: topology.kubernetes.io/zone
+
+      containers:
+      - name: vllm
+        image: vllm/vllm-openai:latest
+        command: ["python", "-m", "vllm.entrypoints.openai.api_server"]
+        args:
+        - --model=meta-llama/Meta-Llama-3-70B
+        - --tensor-parallel-size=4
+        - --host=0.0.0.0
+        - --port=8000
+        ports:
+        - name: http
+          containerPort: 8000
+        resources:
+          requests:
+            nvidia.com/gpu: "4"
+            cpu: "8"
+            memory: "64Gi"
+          limits:
+            nvidia.com/gpu: "4"
+            cpu: "16"
+            memory: "128Gi"
+
+---
+# Example 3: SOFT anti-affinity - prefer spread but allow stacking
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: model-server-prefer-spread
+  labels:
+    app: model-server-prefer-spread
+spec:
+  replicas: 20
+  selector:
+    matchLabels:
+      app: model-server-prefer-spread
+  template:
+    metadata:
+      labels:
+        app: model-server-prefer-spread
+    spec:
+      # PREFER to spread, but allow stacking on same node if needed
+      affinity:
+        podAntiAffinity:
+          # SOFT requirement - prefer different nodes
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100  # Higher weight = stronger preference
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - model-server-prefer-spread
+              topologyKey: kubernetes.io/hostname
+
+      containers:
+      - name: vllm
+        image: vllm/vllm-openai:latest
+        command: ["python", "-m", "vllm.entrypoints.openai.api_server"]
+        args:
+        - --model=meta-llama/Meta-Llama-3-8B
+        - --host=0.0.0.0
+        - --port=8000
+        ports:
+        - name: http
+          containerPort: 8000
+        resources:
+          requests:
+            nvidia.com/gpu: "1"
+            memory: "16Gi"
+
+---
+# Example 4: Combine hard and soft anti-affinity
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: model-server-hybrid-spread
+  labels:
+    app: model-server-hybrid-spread
+spec:
+  replicas: 10
+  selector:
+    matchLabels:
+      app: model-server-hybrid-spread
+  template:
+    metadata:
+      labels:
+        app: model-server-hybrid-spread
+    spec:
+      affinity:
+        podAntiAffinity:
+          # HARD: Don't put more than 1 pod per node (if possible)
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values:
+                - model-server-hybrid-spread
+            topologyKey: kubernetes.io/hostname
+          # SOFT: Also prefer different zones
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 50
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - model-server-hybrid-spread
+              topologyKey: topology.kubernetes.io/zone
+
+      containers:
+      - name: vllm
+        image: vllm/vllm-openai:latest
+        command: ["sleep", "3600"]
+        resources:
+          requests:
+            cpu: "1"
+            memory: "8Gi"
+
+---
+# Example 5: Spread from OTHER apps (not just same app)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: critical-model-service
+  labels:
+    app: critical-model-service
+    priority: critical
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: critical-model-service
+  template:
+    metadata:
+      labels:
+        app: critical-model-service
+        priority: critical
+    spec:
+      # Spread from ALL other model-serving pods
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              # Don't co-locate with any other model service
+              - key: app
+                operator: In
+                values:
+                - model-server-ha
+                - model-server-multi-zone
+                - model-server-prefer-spread
+                - any-model-serving
+            topologyKey: kubernetes.io/hostname
+
+      containers:
+      - name: vllm
+        image: vllm/vllm-openai:latest
+        command: ["sleep", "3600"]
+        resources:
+          requests:
+            nvidia.com/gpu: "2"
+
+---
+# Example 6: Using topology spread constraints (newer, more flexible)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: model-server-topology-spread
+  labels:
+    app: model-server-topology-spread
+spec:
+  replicas: 9
+  selector:
+    matchLabels:
+      app: model-server-topology-spread
+  template:
+    metadata:
+      labels:
+        app: model-server-topology-spread
+    spec:
+      # Use TopologySpreadConstraints for more control
+      topologySpreadConstraints:
+      # Spread across nodes
+      - maxSkew: 1  # Maximum difference in pod count per node
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: DoNotSchedule  # Hard requirement
+        labelSelector:
+          matchLabels:
+            app: model-server-topology-spread
+      # Spread across zones
+      - maxSkew: 2  # Allow 2 more pods in one zone vs another
+        topologyKey: topology.kubernetes.io/zone
+        whenUnsatisfiable: ScheduleAnyway  # Soft requirement
+        labelSelector:
+          matchLabels:
+            app: model-server-topology-spread
+
+      containers:
+      - name: vllm
+        image: vllm/vllm-openai:latest
+        command: ["sleep", "3600"]
+        resources:
+          requests:
+            nvidia.com/gpu: "1"
+
+---
+# How Pod Anti-Affinity Works:
+#
+# ┌─────────────────────────────────────────────────────────────┐
+# │  Without Anti-Affinity (can stack)                          │
+# │  ┌───────────────────────────────────────────────────────┐ │
+# │  │ Node 1: [Pod A, Pod B, Pod C]  ← Single point of failure│ │
+# │  │ Node 2: [Pod D]                                       │ │
+# │  │ Node 3: []                                            │ │
+# │  └───────────────────────────────────────────────────────┘ │
+# │  If Node 1 fails → 3/4 pods down!                          │
+# └─────────────────────────────────────────────────────────────┘
+#                           │
+#                           ▼
+# ┌─────────────────────────────────────────────────────────────┐
+# │  With Anti-Affinity (spread out)                            │
+# │  ┌───────────────────────────────────────────────────────┐ │
+# │  │ Node 1: [Pod A]                                       │ │
+# │  │ Node 2: [Pod B]                                       │ │
+# │  │ Node 3: [Pod C]                                       │ │
+# │  │ Node 4: [Pod D]                                       │ │
+# │  └───────────────────────────────────────────────────────┘ │
+# │  If any node fails → only 1/4 pods down!                   │
+# └─────────────────────────────────────────────────────────────┘
+#
+# Anti-Affinity Types:
+#
+# ┌─────────────────────────────────────────────────────────────┐
+# │  requiredDuringSchedulingIgnoredDuringExecution            │
+# │  - HARD requirement                                         │
+# │  - Must schedule on different nodes                        │
+# │  - If impossible, pod stays Pending                        │
+# │  - Use for: Critical HA requirements                       │
+# │  - Risk: Pending if not enough nodes                       │
+# └─────────────────────────────────────────────────────────────┘
+#
+# ┌─────────────────────────────────────────────────────────────┐
+# │  preferredDuringSchedulingIgnoredDuringExecution           │
+# │  - SOFT requirement                                         │
+# │  - Prefer different nodes, but allow stacking             │
+# │  - Higher weight = stronger preference                     │
+# │  - Use for: Optimization, not hard requirements            │
+# │  - Benefit: Pods always schedule successfully              │
+# └─────────────────────────────────────────────────────────────┘
+#
+# Topology Keys:
+#
+# kubernetes.io/hostname       → Spread across nodes
+# topology.kubernetes.io/zone  → Spread across availability zones
+# topology.kubernetes.io/region → Spread across regions
+#
+# Common Use Cases:
+#
+# 1. High Availability
+#    - Spread across nodes
+#    - No single point of failure
+#
+# 2. Disaster Recovery
+#    - Spread across zones
+#    - Survive zone failures
+#
+# 3. Load Distribution
+#    - Distribute request load
+#    - Better resource utilization
+#
+# 4. Multi-tenant Isolation
+#    - Spread different apps apart
+#    - Prevent resource conflicts
+#
+# Testing:
+#
+# 1. Deploy and check pod distribution:
+#    kubectl apply -f 05-pod-anti-affinity-spreading.yaml
+#    kubectl get pods -o wide -l app=model-server-ha
+#    # All pods should be on different nodes!
+#
+# 2. Check distribution by node:
+#    kubectl get pods -o wide --sort-by=.spec.nodeName
+#
+# 3. Scale beyond available nodes (to see hard anti-affinity limit):
+#    # If you have 3 nodes and deploy 5 pods with hard anti-affinity
+#    # Only 3 will schedule, 2 will be Pending
+#    kubectl scale deployment model-server-ha --replicas=10
+#
+# 4. Test soft anti-affinity (should schedule all):
+#    kubectl scale deployment model-server-prefer-spread --replicas=50
+#    # All should schedule, some will stack on nodes
+#
+# 5. Check zone distribution:
+#    kubectl get pods -o wide -l app=model-server-multi-zone \
+#      -o custom-columns=NAME:.metadata.name,NODE:.spec.nodeName,ZONE:.metadata.labels.topology\.kubernetes\.io/zone
+#
+# Real-World Example Production Pattern:
+#
+# For a production model serving deployment:
+#
+# replicas: 6
+#
+# topologySpreadConstraints:
+# - maxSkew: 1
+#   topologyKey: kubernetes.io/hostname
+#   whenUnsatisfiable: DoNotSchedule
+#
+# This ensures:
+# - Even distribution across nodes
+# - Maximum 1 pod difference between any two nodes
+# - If 6 pods on 6 nodes → 1 pod per node
+# - If 6 pods on 3 nodes → 2 pods per node (balanced)
+# - If 6 pods on 4 nodes → [2, 2, 1, 1] or similar (skew = 1)
