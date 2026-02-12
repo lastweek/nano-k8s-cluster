@@ -83,7 +83,18 @@ kubectl delete -f examples/12-llm-cluster/serving/disaggregated-serving/
 | [examples/07-user-defined-scheduling](examples/07-user-defined-scheduling/) | User-Defined Scheduling | nodeSelector, affinity, taints/tolerations, priority |
 | [examples/08-custom-scheduler-binary](examples/08-custom-scheduler-binary/) | Custom Scheduler Binary | Write your own scheduler in Go/Python |
 | [examples/09-multi-node-serving](examples/09-multi-node-serving/) | Multi-Node Model Serving | StatefulSets, tensor parallelism, Dynamo-like architecture |
-| [examples/10-llm-serving-crd](examples/10-llm-serving-crd/) | LLM Serving CRD & Operator | Custom resource definition, operator, reconciliation |
+| [examples/10-llm-serving-crd](examples/10-llm-serving-crd/) | Production LLM Serving | CRD-based serving with disaggregated prefill/decode architecture, fleet autoscaling, and comprehensive design documentation |
+
+**What You'll Learn**:
+- **Fixed-Shape TP Principle**: Scale by creating whole new LLMCluster instances, not mutating pod counts
+- **Two Serving Modalities**: Monolithic (single TP-8 fleet) vs Disaggregated (separate TP-8 prefill + TP-4 decode with KV cache transfer)
+- **Fleet Autoscaling**: LLMClusterAutoscaler CRD supports both modes via `spec.mode` field
+- **Router Coordination**: Prefill-decode router manages two-phase serving with maxPrefillPerDecode constraints
+- **Production Architecture**: Complete system design with control/data plane separation, fault tolerance, observability
+
+**Key Files**:
+- [ARCHITECTURE.md](ARCHITECTURE.md) - Comprehensive system architecture (design rationale, trade-offs, Mermaid diagrams)
+- [00-LEARNING-PATH.md](00-LEARNING-PATH.md) - Progressive learning guide (foundation → monolithic → disaggregated)
 
 ### 🚀 LLM Cluster Examples
 
@@ -177,4 +188,13 @@ MIT License - see LICENSE file for details
 
 ## Status
 
-🚧 **Work in Progress** - This repository is under active development. Examples are being added progressively.
+🚧 **Active Learning** - This repository captures learning from building production-grade LLM infrastructure.
+
+**Recent Learnings** (LLM Serving):
+**Recent Learnings** (LLM Serving):n- CRD-based architecture enables
+- CRD-based architecture enables declarative infrastructure management
+- Fixed-shape tensor parallelism requires fleet scaling (create/delete instances, not HPA)
+- Disaggregated prefill/decode serving enables independent phase scaling and resource optimization
+- LLMClusterAutoscaler CRD supports both monolithic and disaggregated modes via single `spec.mode` field
+- Router coordination enforces maxPrefillPerDecode to prevent resource exhaustion
+- StatefulSet with OnDelete strategy provides zero-downtime rolling updates
